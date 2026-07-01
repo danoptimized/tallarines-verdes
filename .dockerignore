@@ -1,0 +1,9 @@
+.git
+.dart_tool
+build
+node_modules
+**/node_modules
+ios/Pods
+android/.gradle
+android/local.properties
+*.iml

@@ -49,10 +49,14 @@ Use this architecture:
 - Spotify API backend: Railway (`backend/` service)
 - Data/Auth: Firebase (Firestore + Auth)
 
+Important: the Spotify/OAuth API layer is still a Node.js backend (`backend/server.js`).
+Firebase handles database/auth; it does not replace these Spotify HTTP endpoints.
+
 ### 1) Railway backend service
-Create a Railway service from the `backend/` directory and set:
-- Start command: `npm start`
-- Config file: `backend/railway.json` is included
+You can deploy from repo root (recommended for monorepo):
+- Root `Dockerfile` is included and runs the backend from `backend/`
+- Root `railway.json` forces Dockerfile builds
+- No root-directory override is required
 
 Required Railway environment variables:
 - `SPOTIFY_CLIENT_ID`
