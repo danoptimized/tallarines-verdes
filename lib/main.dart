@@ -4,8 +4,10 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:spotify_sdk/models/player_state.dart';
 import 'package:spotify_sdk/models/track.dart';
@@ -461,6 +463,14 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     return trimmed;
   }
 
+  bool get _supportsSpotifyRemotePlayback {
+    if (kIsWeb) {
+      return false;
+    }
+    return defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
   Uri _backendUri(
     String path, {
     Map<String, String> queryParameters = const <String, String>{},
@@ -805,6 +815,55 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     return 'spotify:track:$trackId';
   }
 
+  bool _isNotImplementedSpotifySdkError(Object error) {
+    if (error is MissingPluginException) {
+      return true;
+    }
+    if (error is PlatformException) {
+      final String code = error.code.toLowerCase();
+      final String message = (error.message ?? '').toLowerCase();
+      return code.contains('notimplemented') || message.contains('not implemented');
+    }
+    return false;
+  }
+
+  Future<void> _openSongInSpotify(Song song, {required String fallbackMessage}) async {
+    final String spotifyUrl = song.spotifyUrl.trim();
+    if (spotifyUrl.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerErrorMessage = 'Song has no Spotify link to open.';
+      });
+      return;
+    }
+    final Uri? uri = Uri.tryParse(spotifyUrl);
+    if (uri == null) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerErrorMessage = 'Song has an invalid Spotify link.';
+      });
+      return;
+    }
+    final bool opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _spotifyPlayerErrorMessage = opened
+          ? fallbackMessage
+          : 'Could not open Spotify for this song.';
+    });
+    if (opened) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Opened song in Spotify app.')),
+      );
+    }
+  }
+
   Future<_SpotifyPlaybackToken> _fetchSpotifyPlaybackToken() async {
     final String? sessionId = _spotifySessionId;
     if (sessionId == null) {
@@ -838,6 +897,9 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   Future<void> _ensureSpotifyPlayerConnected() async {
     if (_spotifyPlayerReady || _isPlayerConnecting) {
       return;
+    }
+    if (!_supportsSpotifyRemotePlayback) {
+      throw MissingPluginException('Spotify SDK remote playback unavailable');
     }
     setState(() {
       _isPlayerConnecting = true;
@@ -897,6 +959,29 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         _spotifyPlayerReady = true;
         _spotifyPlayerState = state;
       });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+        _spotifyPlayerErrorMessage =
+            'In-app Spotify playback is not available on this platform.';
+      });
+      rethrow;
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+        _spotifyPlayerErrorMessage = _isNotImplementedSpotifySdkError(error)
+            ? 'In-app Spotify playback is not available on this build.'
+            : 'Spotify playback unavailable. Reconnect Spotify and ensure Spotify app is open.';
+      });
+      rethrow;
     } catch (_) {
       if (!mounted) {
         return;
@@ -925,6 +1010,14 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       });
       return;
     }
+    if (!_supportsSpotifyRemotePlayback) {
+      await _openSongInSpotify(
+        song,
+        fallbackMessage:
+            'In-app playback is unavailable here. Opened song in Spotify instead.',
+      );
+      return;
+    }
     try {
       await _ensureSpotifyPlayerConnected();
       await SpotifySdk.play(spotifyUri: spotifyUri);
@@ -934,7 +1027,15 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       setState(() {
         _spotifyPlayerErrorMessage = null;
       });
-    } catch (_) {}
+    } catch (error) {
+      if (_isNotImplementedSpotifySdkError(error)) {
+        await _openSongInSpotify(
+          song,
+          fallbackMessage:
+              'In-app playback is unavailable on this build. Opened song in Spotify instead.',
+        );
+      }
+    }
   }
 
   Future<void> _toggleMiniPlayerPlayback() async {
@@ -1186,7 +1287,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
-                    'Pick a song',
+                    'Select current song',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
                   ),
                 ),
@@ -1236,18 +1337,9 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       return;
     }
     _setCurrentSong(selectedSongId);
-    if (_tabIndex != 0) {
-      setState(() {
-        _tabIndex = 0;
-      });
-    }
   }
 
   void _selectBottomAction(int index) {
-    if (index == 2) {
-      unawaited(_showSongPickerModal());
-      return;
-    }
     if (_tabIndex == index) {
       return;
     }
@@ -1291,19 +1383,26 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       bodyContent = SetlistPage(
         songs: _songs,
         currentSong: _currentSong,
-        currentSongPosition: _currentSongPosition,
         totalRuntime: _formatRuntime(_totalRuntimeSeconds),
-        onPreviousSong: () => _stepCurrentSong(-1),
-        onNextSong: () => _stepCurrentSong(1),
         onSelectSong: _setCurrentSong,
         onRemoveSong: _removeSong,
         onPlaySpotify: _playSongInMiniPlayer,
       );
-    } else {
+    } else if (_tabIndex == 1) {
       bodyContent = _SongImporterPage(
         onSongsImported: _upsertImportedSongs,
         spotifySessionId: _spotifySessionId,
         spotifyAccountConnected: _spotifyAccountConnected,
+      );
+    } else {
+      bodyContent = _CurrentSongPage(
+        songs: _songs,
+        currentSong: _currentSong,
+        currentSongPosition: _currentSongPosition,
+        onPreviousSong: () => _stepCurrentSong(-1),
+        onNextSong: () => _stepCurrentSong(1),
+        onPlaySpotify: _playSongInMiniPlayer,
+        onOpenSongPicker: _showSongPickerModal,
       );
     }
 
@@ -1350,7 +1449,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          if (_spotifyAccountConnected)
+          if (_spotifyAccountConnected && _supportsSpotifyRemotePlayback)
             _SpotifyMiniPlayerBar(
               playerState: _spotifyPlayerState,
               isConnecting: _isPlayerConnecting,
@@ -1374,10 +1473,7 @@ class SetlistPage extends StatelessWidget {
     super.key,
     required this.songs,
     required this.currentSong,
-    required this.currentSongPosition,
     required this.totalRuntime,
-    required this.onPreviousSong,
-    required this.onNextSong,
     required this.onSelectSong,
     required this.onRemoveSong,
     required this.onPlaySpotify,
@@ -1385,10 +1481,7 @@ class SetlistPage extends StatelessWidget {
 
   final List<Song> songs;
   final Song? currentSong;
-  final int currentSongPosition;
   final String totalRuntime;
-  final VoidCallback onPreviousSong;
-  final VoidCallback onNextSong;
   final ValueChanged<String> onSelectSong;
   final ValueChanged<String> onRemoveSong;
   final Future<void> Function(Song song) onPlaySpotify;
@@ -1400,195 +1493,16 @@ class SetlistPage extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          const Text(
-            'Tallarines Verdes',
-            style: TextStyle(
-              fontSize: 34,
-              fontWeight: FontWeight.w900,
-              letterSpacing: -0.6,
-              color: _appPrimary,
-            ),
-          ),
-          const SizedBox(height: 6),
           Text(
             'Songs ${songs.length} • Runtime $totalRuntime',
             style: const TextStyle(color: _appMutedText, fontSize: 13),
           ),
-          const SizedBox(height: 14),
-          _SectionCard(
-            child: currentSong == null
-                ? const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 28),
-                    child: Center(
-                      child: Text(
-                        'Add your first song from Importer.',
-                        style: TextStyle(color: _appMutedText),
-                      ),
-                    ),
-                  )
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      const _SectionLabel(text: 'Now Playing'),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Song $currentSongPosition of ${songs.length}',
-                        style: const TextStyle(
-                          color: _appMutedText,
-                          fontSize: 12,
-                          letterSpacing: 0.7,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                Text(
-                                  currentSong!.title,
-                                  style: const TextStyle(
-                                    fontSize: 28,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: -0.3,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  currentSong!.artist,
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    color: _appMutedText,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          if (currentSong!.artworkUrl != null)
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(14),
-                              child: Image.network(
-                                currentSong!.artworkUrl!,
-                                width: 72,
-                                height: 72,
-                                fit: BoxFit.cover,
-                                errorBuilder:
-                                    (
-                                      BuildContext context,
-                                      Object error,
-                                      StackTrace? stackTrace,
-                                    ) {
-                                      return const SizedBox.shrink();
-                                    },
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      if (currentSong!.roles.isEmpty)
-                        const Text(
-                          'No instrument roles assigned.',
-                          style: TextStyle(color: _appMutedText),
-                        )
-                      else
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: currentSong!.roles.map((
-                            RoleAssignment role,
-                          ) {
-                            return Chip(
-                              backgroundColor: _appSurfaceStrong,
-                              side: BorderSide(
-                                color: Colors.white.withValues(alpha: 0.08),
-                              ),
-                              label: Text(
-                                '${role.instrument}: ${role.player}',
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            );
-                          }).toList(),
-                        ),
-                      if (currentSong!.notes.trim().isNotEmpty) ...<Widget>[
-                        const SizedBox(height: 12),
-                        Text(
-                          currentSong!.notes.trim(),
-                          style: const TextStyle(
-                            color: _appMutedText,
-                            fontSize: 13,
-                            height: 1.4,
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 14),
-                      Row(
-                        children: <Widget>[
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: onPreviousSong,
-                              icon: const Icon(Icons.skip_previous_rounded),
-                              label: const Text('Previous'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.white,
-                                side: BorderSide(
-                                  color: Colors.white.withValues(alpha: 0.15),
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: onNextSong,
-                              icon: const Icon(Icons.skip_next_rounded),
-                              label: const Text('Next'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.white,
-                                side: BorderSide(
-                                  color: Colors.white.withValues(alpha: 0.15),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      if (currentSong!.spotifyUrl
-                          .trim()
-                          .isNotEmpty) ...<Widget>[
-                        const SizedBox(height: 8),
-                        SizedBox(
-                          width: double.infinity,
-                          child: FilledButton.icon(
-                            onPressed: () => onPlaySpotify(currentSong!),
-                            icon: const Icon(Icons.play_arrow_rounded),
-                            label: const Text('Play in app'),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: _appPrimary,
-                              foregroundColor: const Color(0xFF171717),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-          ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 12),
           _SectionCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                const _SectionLabel(text: 'Entire Setlist View'),
-                const SizedBox(height: 8),
-                const Text(
-                  'Full running order',
-                  style: TextStyle(
-                    fontSize: 21,
-                    fontWeight: FontWeight.w700,
-                    color: _appPrimary,
-                  ),
-                ),
+                const _SectionLabel(text: 'Setlist'),
                 const SizedBox(height: 10),
                 if (songs.isEmpty)
                   const Padding(
@@ -1736,7 +1650,217 @@ class SetlistPage extends StatelessWidget {
   }
 }
 
+class _CurrentSongPage extends StatelessWidget {
+  const _CurrentSongPage({
+    required this.songs,
+    required this.currentSong,
+    required this.currentSongPosition,
+    required this.onPreviousSong,
+    required this.onNextSong,
+    required this.onPlaySpotify,
+    required this.onOpenSongPicker,
+  });
+
+  final List<Song> songs;
+  final Song? currentSong;
+  final int currentSongPosition;
+  final VoidCallback onPreviousSong;
+  final VoidCallback onNextSong;
+  final Future<void> Function(Song song) onPlaySpotify;
+  final Future<void> Function() onOpenSongPicker;
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _SectionCard(
+            child: currentSong == null
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 28),
+                    child: Center(
+                      child: Text(
+                        'No current song selected yet.',
+                        style: TextStyle(color: _appMutedText),
+                      ),
+                    ),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      const _SectionLabel(text: 'Current Song'),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Song $currentSongPosition of ${songs.length}',
+                        style: const TextStyle(
+                          color: _appMutedText,
+                          fontSize: 12,
+                          letterSpacing: 0.7,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(
+                                  currentSong!.title,
+                                  style: const TextStyle(
+                                    fontSize: 28,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: -0.3,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  currentSong!.artist,
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    color: _appMutedText,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (currentSong!.artworkUrl != null)
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(14),
+                              child: Image.network(
+                                currentSong!.artworkUrl!,
+                                width: 72,
+                                height: 72,
+                                fit: BoxFit.cover,
+                                errorBuilder:
+                                    (
+                                      BuildContext context,
+                                      Object error,
+                                      StackTrace? stackTrace,
+                                    ) {
+                                      return const SizedBox.shrink();
+                                    },
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (currentSong!.roles.isEmpty)
+                        const Text(
+                          'No instrument roles assigned.',
+                          style: TextStyle(color: _appMutedText),
+                        )
+                      else
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: currentSong!.roles.map((
+                            RoleAssignment role,
+                          ) {
+                            return Chip(
+                              backgroundColor: _appSurfaceStrong,
+                              side: BorderSide(
+                                color: Colors.white.withValues(alpha: 0.08),
+                              ),
+                              label: Text(
+                                '${role.instrument}: ${role.player}',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      if (currentSong!.notes.trim().isNotEmpty) ...<Widget>[
+                        const SizedBox(height: 12),
+                        Text(
+                          currentSong!.notes.trim(),
+                          style: const TextStyle(
+                            color: _appMutedText,
+                            fontSize: 13,
+                            height: 1.4,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 14),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: onPreviousSong,
+                              icon: const Icon(Icons.skip_previous_rounded),
+                              label: const Text('Previous'),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                side: BorderSide(
+                                  color: Colors.white.withValues(alpha: 0.15),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: onNextSong,
+                              icon: const Icon(Icons.skip_next_rounded),
+                              label: const Text('Next'),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                side: BorderSide(
+                                  color: Colors.white.withValues(alpha: 0.15),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () {
+                            unawaited(onOpenSongPicker());
+                          },
+                          icon: const Icon(Icons.library_music_rounded),
+                          label: const Text('Choose current song'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            side: BorderSide(
+                              color: Colors.white.withValues(alpha: 0.15),
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (currentSong!.spotifyUrl
+                          .trim()
+                          .isNotEmpty) ...<Widget>[
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            onPressed: () => onPlaySpotify(currentSong!),
+                            icon: const Icon(Icons.play_arrow_rounded),
+                            label: const Text('Play in app'),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _appPrimary,
+                              foregroundColor: const Color(0xFF171717),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+          ),
+          const SizedBox(height: 84),
+        ],
+      ),
+    );
+  }
+}
+
 enum _ImportState { idle, loading, success, error }
+enum _ImporterStep { choose, link, account, details }
 
 class _RoleDraft {
   _RoleDraft({required this.id, String instrument = '', String player = ''})
@@ -1786,6 +1910,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   String? _importedSpotifyUri;
   SongSourceType _importSourceType = SongSourceType.manual;
   _ImportState _importState = _ImportState.idle;
+  _ImporterStep _importerStep = _ImporterStep.choose;
   String _statusMessage = '';
   String? get _spotifySessionId {
     final String trimmed = (widget.spotifySessionId ?? '').trim();
@@ -2426,6 +2551,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
             : 'spotify:track:$_importedSpotifyTrackId';
         _importSourceType = SongSourceType.spotifyUrl;
         _artworkUrl = importedArtwork.isEmpty ? null : importedArtwork;
+        _importerStep = _ImporterStep.details;
         _importState = _ImportState.success;
         _statusMessage =
             'Imported song name, artist, cover image (when available), and Spotify link.';
@@ -2523,7 +2649,380 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       _statusMessage =
           'Import complete: ${mergeResult.addedCount} added, ${mergeResult.updatedCount} updated.';
       _resetDraft();
+      _importerStep = _ImporterStep.choose;
     });
+  }
+
+  void _setImporterStep(_ImporterStep step) {
+    if (_importerStep == step) {
+      return;
+    }
+    setState(() {
+      _importerStep = step;
+    });
+  }
+
+  Widget _buildStatusMessage(Color statusColor) {
+    if (_statusMessage.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Text(
+        _statusMessage,
+        style: TextStyle(color: statusColor, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _buildStepBackButton(_ImporterStep step) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () => _setImporterStep(step),
+        icon: const Icon(Icons.arrow_back_rounded),
+        label: const Text('Back'),
+      ),
+    );
+  }
+
+  Widget _buildChooseStep(Color statusColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const _SectionLabel(text: 'Choose import method'),
+              const SizedBox(height: 10),
+              FilledButton.icon(
+                onPressed: () => _setImporterStep(_ImporterStep.link),
+                icon: const Icon(Icons.link_rounded),
+                label: const Text('Import with Spotify link'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: _appPrimary,
+                  foregroundColor: const Color(0xFF131313),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+              const SizedBox(height: 10),
+              FilledButton.tonalIcon(
+                onPressed: () => _setImporterStep(_ImporterStep.account),
+                icon: const Icon(Icons.account_circle_rounded),
+                label: const Text('Import from connected Spotify account'),
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+              if (!widget.spotifyAccountConnected) ...<Widget>[
+                const SizedBox(height: 8),
+                const Text(
+                  'Connect Spotify from the top bar to use playlist, liked songs, and recently played imports.',
+                  style: TextStyle(color: _appMutedText, fontSize: 12),
+                ),
+              ],
+              _buildStatusMessage(statusColor),
+            ],
+          ),
+        ),
+        const SizedBox(height: 84),
+      ],
+    );
+  }
+
+  Widget _buildLinkStep(Color statusColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _buildStepBackButton(_ImporterStep.choose),
+        const SizedBox(height: 4),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const _SectionLabel(text: 'Import with link'),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _spotifyUrlController,
+                decoration: const InputDecoration(
+                  hintText: 'https://open.spotify.com/track/... (or playlist/...)',
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _importState == _ImportState.loading
+                      ? null
+                      : _importSpotifyMetadata,
+                  icon: _importState == _ImportState.loading
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.download_rounded),
+                  label: Text(
+                    _importState == _ImportState.loading
+                        ? 'Importing...'
+                        : 'Import from Spotify link',
+                  ),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _appPrimary,
+                    foregroundColor: const Color(0xFF131313),
+                  ),
+                ),
+              ),
+              _buildStatusMessage(statusColor),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const _SectionLabel(text: 'Song details'),
+              const SizedBox(height: 10),
+              const Text(
+                'For track links, continue to review/edit song details before adding.',
+                style: TextStyle(color: _appMutedText, fontSize: 12),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: () => _setImporterStep(_ImporterStep.details),
+                icon: const Icon(Icons.edit_note_rounded),
+                label: const Text('Open song details'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: BorderSide(color: Colors.white.withValues(alpha: 0.15)),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 84),
+      ],
+    );
+  }
+
+  Widget _buildAccountStep(Color statusColor) {
+    final bool accountImportDisabled =
+        _spotifySessionId == null ||
+        !widget.spotifyAccountConnected ||
+        _importState == _ImportState.loading;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _buildStepBackButton(_ImporterStep.choose),
+        const SizedBox(height: 4),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const _SectionLabel(text: 'Spotify account imports'),
+              const SizedBox(height: 10),
+              FilledButton.tonalIcon(
+                onPressed: accountImportDisabled ? null : _importFromMyPlaylists,
+                icon: const Icon(Icons.queue_music_rounded),
+                label: const Text('My Playlists'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.tonalIcon(
+                onPressed: accountImportDisabled ? null : _importLikedSongs,
+                icon: const Icon(Icons.favorite_rounded),
+                label: const Text('Liked Songs'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.tonalIcon(
+                onPressed: accountImportDisabled ? null : _importRecentlyPlayed,
+                icon: const Icon(Icons.history_rounded),
+                label: const Text('Recently Played'),
+              ),
+              if (!widget.spotifyAccountConnected) ...<Widget>[
+                const SizedBox(height: 8),
+                const Text(
+                  'Spotify account imports are disabled until Spotify is connected.',
+                  style: TextStyle(color: _appMutedText, fontSize: 12),
+                ),
+              ],
+              _buildStatusMessage(statusColor),
+            ],
+          ),
+        ),
+        const SizedBox(height: 84),
+      ],
+    );
+  }
+
+  Widget _buildDetailsStep(Color statusColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _buildStepBackButton(_ImporterStep.link),
+        const SizedBox(height: 4),
+        if (_artworkUrl != null) ...<Widget>[
+          _SectionCard(
+            child: Row(
+              children: <Widget>[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: Image.network(
+                    _artworkUrl!,
+                    width: 72,
+                    height: 72,
+                    fit: BoxFit.cover,
+                    errorBuilder:
+                        (
+                          BuildContext context,
+                          Object error,
+                          StackTrace? stackTrace,
+                        ) {
+                          return Container(
+                            width: 72,
+                            height: 72,
+                            color: _appSurfaceStrong,
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.music_note_rounded),
+                          );
+                        },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'Cover art imported from Spotify.',
+                    style: TextStyle(color: _appMutedText, fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const _SectionLabel(text: 'Song details'),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _titleController,
+                decoration: const InputDecoration(labelText: 'Song title'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _artistController,
+                decoration: const InputDecoration(labelText: 'Artist'),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: TextField(
+                      controller: _durationController,
+                      decoration: const InputDecoration(
+                        labelText: 'Duration (mm:ss)',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _bpmController,
+                      decoration: const InputDecoration(labelText: 'BPM'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _keyController,
+                decoration: const InputDecoration(labelText: 'Key'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _notesController,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  labelText: 'Notes',
+                  alignLabelWithHint: true,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  const _SectionLabel(text: 'Instrument roles'),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: _addRoleDraft,
+                    icon: const Icon(Icons.add),
+                    label: const Text('Add role'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ..._roleDrafts.map((_RoleDraft roleDraft) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: TextField(
+                          controller: roleDraft.instrumentController,
+                          decoration: const InputDecoration(
+                            labelText: 'Instrument',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: TextField(
+                          controller: roleDraft.playerController,
+                          decoration: const InputDecoration(
+                            labelText: 'Player',
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => _removeRoleDraft(roleDraft),
+                        icon: const Icon(Icons.delete_outline_rounded),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: _createSong,
+          icon: const Icon(Icons.library_add_rounded),
+          label: const Text('Add song to setlist'),
+          style: FilledButton.styleFrom(
+            backgroundColor: _appPrimary,
+            foregroundColor: const Color(0xFF131313),
+            padding: const EdgeInsets.symmetric(vertical: 14),
+          ),
+        ),
+        _buildStatusMessage(statusColor),
+        const SizedBox(height: 8),
+        const Text(
+          'Saved songs keep their Spotify link, so players can open each track directly.',
+          style: TextStyle(color: _appMutedText, fontSize: 12),
+        ),
+        const SizedBox(height: 84),
+      ],
+    );
   }
 
   @override
@@ -2535,280 +3034,21 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       _ImportState.idle => _appMutedText,
     };
 
+    final Widget stepContent = switch (_importerStep) {
+      _ImporterStep.choose => _buildChooseStep(statusColor),
+      _ImporterStep.link => _buildLinkStep(statusColor),
+      _ImporterStep.account => _buildAccountStep(statusColor),
+      _ImporterStep.details => _buildDetailsStep(statusColor),
+    };
+
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const Text(
-            'Import + Add Song',
-            style: TextStyle(
-              fontSize: 30,
-              fontWeight: FontWeight.w900,
-              color: _appPrimary,
-            ),
-          ),
-          const SizedBox(height: 6),
-          const Text(
-            'Import title, artist, cover, and link from Spotify, then assign instrument roles.',
-            style: TextStyle(color: _appMutedText, fontSize: 13),
-          ),
-          const SizedBox(height: 14),
-          _SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const Text(
-                  'Spotify link',
-                  style: TextStyle(
-                    fontSize: 12,
-                    letterSpacing: 0.7,
-                    color: _appMutedText,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _spotifyUrlController,
-                  decoration: const InputDecoration(
-                    hintText:
-                        'https://open.spotify.com/track/... (or playlist/...)',
-                  ),
-                ),
-                const SizedBox(height: 10),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    onPressed: _importState == _ImportState.loading
-                        ? null
-                        : _importSpotifyMetadata,
-                    icon: _importState == _ImportState.loading
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.download_rounded),
-                    label: Text(
-                      _importState == _ImportState.loading
-                          ? 'Importing...'
-                          : 'Import from Spotify',
-                    ),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _appPrimary,
-                      foregroundColor: const Color(0xFF131313),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: <Widget>[
-                    FilledButton.tonalIcon(
-                      onPressed:
-                          (_spotifySessionId == null ||
-                              !widget.spotifyAccountConnected ||
-                              _importState == _ImportState.loading)
-                          ? null
-                          : _importFromMyPlaylists,
-                      icon: const Icon(Icons.queue_music_rounded),
-                      label: const Text('My Playlists'),
-                    ),
-                    FilledButton.tonalIcon(
-                      onPressed:
-                          (_spotifySessionId == null ||
-                              !widget.spotifyAccountConnected ||
-                              _importState == _ImportState.loading)
-                          ? null
-                          : _importLikedSongs,
-                      icon: const Icon(Icons.favorite_rounded),
-                      label: const Text('Liked Songs'),
-                    ),
-                    FilledButton.tonalIcon(
-                      onPressed:
-                          (_spotifySessionId == null ||
-                              !widget.spotifyAccountConnected ||
-                              _importState == _ImportState.loading)
-                          ? null
-                          : _importRecentlyPlayed,
-                      icon: const Icon(Icons.history_rounded),
-                      label: const Text('Recently Played'),
-                    ),
-                  ],
-                ),
-                if (_statusMessage.isNotEmpty) ...<Widget>[
-                  const SizedBox(height: 8),
-                  Text(
-                    _statusMessage,
-                    style: TextStyle(color: statusColor, fontSize: 12),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          if (_artworkUrl != null) ...<Widget>[
-            const SizedBox(height: 12),
-            _SectionCard(
-              child: Row(
-                children: <Widget>[
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(14),
-                    child: Image.network(
-                      _artworkUrl!,
-                      width: 72,
-                      height: 72,
-                      fit: BoxFit.cover,
-                      errorBuilder:
-                          (
-                            BuildContext context,
-                            Object error,
-                            StackTrace? stackTrace,
-                          ) {
-                            return Container(
-                              width: 72,
-                              height: 72,
-                              color: _appSurfaceStrong,
-                              alignment: Alignment.center,
-                              child: const Icon(Icons.music_note_rounded),
-                            );
-                          },
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      'Cover art imported from Spotify.',
-                      style: const TextStyle(
-                        color: _appMutedText,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-          const SizedBox(height: 12),
-          _SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const _SectionLabel(text: 'Song details'),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _titleController,
-                  decoration: const InputDecoration(labelText: 'Song title'),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _artistController,
-                  decoration: const InputDecoration(labelText: 'Artist'),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: TextField(
-                        controller: _durationController,
-                        decoration: const InputDecoration(
-                          labelText: 'Duration (mm:ss)',
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _bpmController,
-                        decoration: const InputDecoration(labelText: 'BPM'),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _keyController,
-                  decoration: const InputDecoration(labelText: 'Key'),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _notesController,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                    labelText: 'Notes',
-                    alignLabelWithHint: true,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          _SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Row(
-                  children: <Widget>[
-                    const _SectionLabel(text: 'Instrument roles'),
-                    const Spacer(),
-                    TextButton.icon(
-                      onPressed: _addRoleDraft,
-                      icon: const Icon(Icons.add),
-                      label: const Text('Add role'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                ..._roleDrafts.map((_RoleDraft roleDraft) {
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Row(
-                      children: <Widget>[
-                        Expanded(
-                          child: TextField(
-                            controller: roleDraft.instrumentController,
-                            decoration: const InputDecoration(
-                              labelText: 'Instrument',
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: TextField(
-                            controller: roleDraft.playerController,
-                            decoration: const InputDecoration(
-                              labelText: 'Player',
-                            ),
-                          ),
-                        ),
-                        IconButton(
-                          onPressed: () => _removeRoleDraft(roleDraft),
-                          icon: const Icon(Icons.delete_outline_rounded),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          FilledButton.icon(
-            onPressed: _createSong,
-            icon: const Icon(Icons.library_add_rounded),
-            label: const Text('Add song to setlist'),
-            style: FilledButton.styleFrom(
-              backgroundColor: _appPrimary,
-              foregroundColor: const Color(0xFF131313),
-              padding: const EdgeInsets.symmetric(vertical: 14),
-            ),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Saved songs keep their Spotify link, so players can open each track directly.',
-            style: TextStyle(color: _appMutedText, fontSize: 12),
-          ),
-          const SizedBox(height: 84),
-        ],
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 220),
+        child: KeyedSubtree(
+          key: ValueKey<_ImporterStep>(_importerStep),
+          child: stepContent,
+        ),
       ),
     );
   }
@@ -3118,9 +3358,9 @@ class _BottomActionBar extends StatelessWidget {
             ),
             Expanded(
               child: _BottomActionButton(
-                label: 'Pick Song',
-                icon: Icons.music_note_rounded,
-                selected: false,
+                label: 'Current Song',
+                icon: Icons.equalizer_rounded,
+                selected: activeIndex == 2,
                 onPressed: () => onActionPressed(2),
               ),
             ),
