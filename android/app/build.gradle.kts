@@ -18,6 +18,8 @@ android {
     }
 
     defaultConfig {
+        manifestPlaceholders["redirectSchemeName"] = "spotify-sdk"
+        manifestPlaceholders["redirectHostName"] = "auth"
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.tallarinesverdes.tallarines_verdes_flutter"
         // You can update the following values to match your application needs.

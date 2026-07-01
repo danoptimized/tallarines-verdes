@@ -827,43 +827,6 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     return false;
   }
 
-  Future<void> _openSongInSpotify(Song song, {required String fallbackMessage}) async {
-    final String spotifyUrl = song.spotifyUrl.trim();
-    if (spotifyUrl.isEmpty) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _spotifyPlayerErrorMessage = 'Song has no Spotify link to open.';
-      });
-      return;
-    }
-    final Uri? uri = Uri.tryParse(spotifyUrl);
-    if (uri == null) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _spotifyPlayerErrorMessage = 'Song has an invalid Spotify link.';
-      });
-      return;
-    }
-    final bool opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _spotifyPlayerErrorMessage = opened
-          ? fallbackMessage
-          : 'Could not open Spotify for this song.';
-    });
-    if (opened) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Opened song in Spotify app.')),
-      );
-    }
-  }
-
   Future<_SpotifyPlaybackToken> _fetchSpotifyPlaybackToken() async {
     final String? sessionId = _spotifySessionId;
     if (sessionId == null) {
@@ -1011,10 +974,17 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       return;
     }
     if (!_supportsSpotifyRemotePlayback) {
-      await _openSongInSpotify(
-        song,
-        fallbackMessage:
-            'In-app playback is unavailable here. Opened song in Spotify instead.',
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerErrorMessage =
+            'In-app Spotify playback is unavailable on this platform.';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('In-app Spotify playback is unavailable on this platform.'),
+        ),
       );
       return;
     }
@@ -1028,13 +998,14 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         _spotifyPlayerErrorMessage = null;
       });
     } catch (error) {
-      if (_isNotImplementedSpotifySdkError(error)) {
-        await _openSongInSpotify(
-          song,
-          fallbackMessage:
-              'In-app playback is unavailable on this build. Opened song in Spotify instead.',
-        );
+      if (!mounted) {
+        return;
       }
+      setState(() {
+        _spotifyPlayerErrorMessage = _isNotImplementedSpotifySdkError(error)
+            ? 'In-app Spotify playback is unavailable in this build.'
+            : 'Could not start Spotify playback.';
+      });
     }
   }
 
