@@ -8,11 +8,11 @@ import { getFirestore } from 'firebase-admin/firestore';
 
 const app = express();
 const port = Number(process.env.PORT || '8787');
-const rawBaseUrl = (process.env.BASE_URL || 'https://lull.works/tv').trim();
+const rawBaseUrl = (process.env.BASE_URL || 'https://tv.lull.works').trim();
 const baseUrl = rawBaseUrl.endsWith('/')
   ? rawBaseUrl.substring(0, rawBaseUrl.length - 1)
   : rawBaseUrl;
-const rawApiPrefix = (process.env.API_PREFIX || '/tv').trim();
+const rawApiPrefix = (process.env.API_PREFIX || '').trim();
 const apiPrefix = (() => {
   if (!rawApiPrefix || rawApiPrefix === '/') {
     return '';
@@ -31,7 +31,7 @@ const firebaseServiceAccountJson = (
 ).trim();
 const rawCorsAllowedOrigins = (
   process.env.CORS_ALLOWED_ORIGINS ||
-  'https://lull.works,https://www.lull.works,http://localhost:3000,http://localhost:5173'
+  'https://lull.works,https://www.lull.works,https://tv.lull.works,http://localhost:3000,http://localhost:5173'
 ).trim();
 const corsAllowedOrigins = rawCorsAllowedOrigins
   .split(',')

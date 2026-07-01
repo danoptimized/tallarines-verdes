@@ -24,17 +24,16 @@ The Flutter importer can resolve playlist URLs and account-linked imports throug
 2. Setup backend environment:
    - `cp backend/.env.example backend/.env`
    - Fill `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`
-   - Keep `BASE_URL=https://lull.works/tv` and `API_PREFIX=/tv` for deployed usage
-   - This keeps all Spotify backend routes under `/tv/*` so root `lull.works/*` remains untouched
-   - In Spotify app settings, use redirect URI: `https://lull.works/tv/spotify/connect/callback`
+   - Keep `BASE_URL=https://tv.lull.works` and `API_PREFIX=` (empty) for deployed usage
+   - In Spotify app settings, use redirect URI: `https://tv.lull.works/spotify/connect/callback`
 3. Start backend:
    - `cd backend`
    - `npm install`
    - `npm run dev`
-By default, Flutter targets `https://lull.works/tv`.
+By default, Flutter targets `https://tv.lull.works`.
 For local development, override this:
-- `flutter run --dart-define=SPOTIFY_BACKEND_BASE_URL=http://localhost:8787/tv`
-- `flutter run --dart-define=SPOTIFY_BACKEND_BASE_URL=http://<host>:<port>/tv`
+- `flutter run --dart-define=SPOTIFY_BACKEND_BASE_URL=http://localhost:8787`
+- `flutter run --dart-define=SPOTIFY_BACKEND_BASE_URL=http://<host>:<port>`
 
 With the backend running, the app supports:
 - Import by Spotify track/playlist URL
@@ -61,11 +60,11 @@ You can deploy from repo root (recommended for monorepo):
 Required Railway environment variables:
 - `SPOTIFY_CLIENT_ID`
 - `SPOTIFY_CLIENT_SECRET`
-- `BASE_URL=https://lull.works/tv`
-- `API_PREFIX=/tv`
+- `BASE_URL=https://tv.lull.works`
+- `API_PREFIX=` (empty)
 - `FIREBASE_PROJECT_ID=tallerines-verdes`
 - `FIREBASE_SERVICE_ACCOUNT_JSON=<service-account-json>`
-- `CORS_ALLOWED_ORIGINS=https://lull.works,https://www.lull.works`
+- `CORS_ALLOWED_ORIGINS=https://lull.works,https://www.lull.works,https://tv.lull.works`
 
 ### 2) Firebase Admin service account for backend
 In Firebase Console:
@@ -77,14 +76,14 @@ This enables durable backend session storage in Firestore (`spotify_sessions`), 
 
 ### 3) Spotify app callback
 In Spotify Developer Dashboard, keep:
-- `https://lull.works/tv/spotify/connect/callback`
+- `https://tv.lull.works/spotify/connect/callback`
 
 ### 4) Frontend production env
 Build/run frontend with:
-- `SPOTIFY_BACKEND_BASE_URL=https://lull.works/tv`
+- `SPOTIFY_BACKEND_BASE_URL=https://tv.lull.works`
 
 ### 5) Smoke tests after deploy
-1. Open `https://lull.works/tv/health` (expect JSON `{ "ok": true }`)
+1. Open `https://tv.lull.works/health` (expect JSON `{ "ok": true }`)
 2. Open app and connect Spotify
 3. Import from playlist + liked songs
 4. Restart backend service

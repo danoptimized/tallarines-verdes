@@ -99,7 +99,7 @@ String _normalizeForMatch(String value) {
 
 const String _spotifyBackendBaseUrl = String.fromEnvironment(
   'SPOTIFY_BACKEND_BASE_URL',
-  defaultValue: 'https://lull.works/tv',
+  defaultValue: 'https://tv.lull.works',
 );
 
 class _SpotifyImportTrack {
