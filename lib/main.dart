@@ -128,6 +128,20 @@ const String _spotifySdkRedirectUri = String.fromEnvironment(
   'SPOTIFY_SDK_REDIRECT_URI',
   defaultValue: '',
 );
+const String _spotifyAndroidAppRemoteRedirectUri = 'spotify-sdk://auth';
+const String _spotifyRemoteAuthScope =
+    'app-remote-control,user-modify-playback-state,user-read-playback-state,user-read-currently-playing,streaming';
+
+String _resolveSpotifySdkRedirectUri(String serverRedirectUri) {
+  final String configuredRedirectUri = _spotifySdkRedirectUri.trim();
+  if (configuredRedirectUri.isNotEmpty) {
+    return configuredRedirectUri;
+  }
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    return _spotifyAndroidAppRemoteRedirectUri;
+  }
+  return serverRedirectUri.trim();
+}
 
 class _SpotifyImportTrack {
   const _SpotifyImportTrack({
@@ -180,9 +194,7 @@ class _SpotifyPlaybackToken {
     final String clientId = _spotifySdkClientId.isEmpty
         ? serverClientId
         : _spotifySdkClientId.trim();
-    final String redirectUri = _spotifySdkRedirectUri.isEmpty
-        ? serverRedirectUri
-        : _spotifySdkRedirectUri.trim();
+    final String redirectUri = _resolveSpotifySdkRedirectUri(serverRedirectUri);
     return _SpotifyPlaybackToken(
       accessToken: accessToken,
       clientId: clientId,
@@ -857,6 +869,70 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     return token;
   }
 
+  Future<void> _authorizeSpotifyRemoteClient(
+    _SpotifyPlaybackToken token,
+  ) async {
+    await SpotifySdk.getAccessToken(
+      clientId: token.clientId,
+      redirectUrl: token.redirectUri,
+      scope: _spotifyRemoteAuthScope,
+    );
+  }
+
+  Future<void> _connectSpotifyRemoteAndSubscribe(
+    _SpotifyPlaybackToken token,
+  ) async {
+    final bool connected = await SpotifySdk.connectToSpotifyRemote(
+      clientId: token.clientId,
+      redirectUrl: token.redirectUri,
+      accessToken: token.accessToken,
+    );
+    if (!connected) {
+      throw const FormatException('Could not connect to Spotify remote');
+    }
+    await _spotifyPlayerStateSubscription?.cancel();
+    _spotifyPlayerStateSubscription = SpotifySdk.subscribePlayerState().listen(
+      (PlayerState state) {
+        if (!mounted) {
+          return;
+        }
+        final String? activeTrackId = _trackIdFromSpotifyUri(state.track?.uri);
+        String? nextCurrentSongId = _currentSongId;
+        if (activeTrackId != null) {
+          final Song? matchingSong = _songs.cast<Song?>().firstWhere(
+            (Song? song) => (song?.spotifyTrackId ?? '').trim() == activeTrackId,
+            orElse: () => null,
+          );
+          if (matchingSong != null) {
+            nextCurrentSongId = matchingSong.id;
+          }
+        }
+        setState(() {
+          _spotifyPlayerState = state;
+          _spotifyPlayerReady = true;
+          _currentSongId = nextCurrentSongId;
+        });
+      },
+      onError: (Object _) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _spotifyPlayerReady = false;
+          _spotifyPlayerState = null;
+        });
+      },
+    );
+    final PlayerState? state = await SpotifySdk.getPlayerState();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _spotifyPlayerReady = true;
+      _spotifyPlayerState = state;
+    });
+  }
+
   Future<void> _ensureSpotifyPlayerConnected() async {
     if (_spotifyPlayerReady || _isPlayerConnecting) {
       return;
@@ -870,58 +946,15 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     });
     try {
       final _SpotifyPlaybackToken token = await _fetchSpotifyPlaybackToken();
-      final bool connected = await SpotifySdk.connectToSpotifyRemote(
-        clientId: token.clientId,
-        redirectUrl: token.redirectUri,
-        accessToken: token.accessToken,
-      );
-      if (!connected) {
-        throw const FormatException('Could not connect to Spotify remote');
+      try {
+        await _connectSpotifyRemoteAndSubscribe(token);
+      } on PlatformException catch (error) {
+        if (error.code != 'UserNotAuthorizedException') {
+          rethrow;
+        }
+        await _authorizeSpotifyRemoteClient(token);
+        await _connectSpotifyRemoteAndSubscribe(token);
       }
-      await _spotifyPlayerStateSubscription?.cancel();
-      _spotifyPlayerStateSubscription = SpotifySdk.subscribePlayerState().listen(
-        (PlayerState state) {
-          if (!mounted) {
-            return;
-          }
-          final String? activeTrackId = _trackIdFromSpotifyUri(
-            state.track?.uri,
-          );
-          String? nextCurrentSongId = _currentSongId;
-          if (activeTrackId != null) {
-            final Song? matchingSong = _songs.cast<Song?>().firstWhere(
-              (Song? song) =>
-                  (song?.spotifyTrackId ?? '').trim() == activeTrackId,
-              orElse: () => null,
-            );
-            if (matchingSong != null) {
-              nextCurrentSongId = matchingSong.id;
-            }
-          }
-          setState(() {
-            _spotifyPlayerState = state;
-            _spotifyPlayerReady = true;
-            _currentSongId = nextCurrentSongId;
-          });
-        },
-        onError: (Object _) {
-          if (!mounted) {
-            return;
-          }
-          setState(() {
-            _spotifyPlayerReady = false;
-            _spotifyPlayerState = null;
-          });
-        },
-      );
-      final PlayerState? state = await SpotifySdk.getPlayerState();
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _spotifyPlayerReady = true;
-        _spotifyPlayerState = state;
-      });
     } on MissingPluginException {
       if (!mounted) {
         return;
@@ -942,6 +975,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         _spotifyPlayerState = null;
         _spotifyPlayerErrorMessage = _isNotImplementedSpotifySdkError(error)
             ? 'In-app Spotify playback is not available on this build.'
+            : error.code == 'UserNotAuthorizedException'
+            ? 'Spotify authorization required. Approve this app in Spotify and try again.'
             : 'Spotify playback unavailable. Reconnect Spotify and ensure Spotify app is open.';
       });
       rethrow;
