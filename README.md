@@ -41,6 +41,11 @@ With the backend running, the app supports:
   - My Playlists
   - Liked Songs
   - Recently Played
+- In-app Spotify playback mini player (Premium + Spotify app required on device)
+
+For in-app playback, optionally pass SDK values (backend defaults are used if omitted):
+- `flutter run --dart-define=SPOTIFY_SDK_CLIENT_ID=<spotify-client-id> --dart-define=SPOTIFY_SDK_REDIRECT_URI=<whitelisted-redirect-uri>`
+- Example redirect URI: `https://tv.lull.works/spotify/connect/callback`
 
 ## Production launch (Railway + Firebase)
 Use this architecture:

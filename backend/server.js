@@ -167,6 +167,19 @@ function normalizePlaylist(playlist) {
   };
 }
 
+function firstSpotifyImageUrl(images) {
+  if (!Array.isArray(images)) {
+    return null;
+  }
+  for (const image of images) {
+    const url = (image?.url || '').trim();
+    if (url) {
+      return url;
+    }
+  }
+  return null;
+}
+
 function spotifyAuthHeader() {
   return `Basic ${Buffer.from(`${spotifyClientId}:${spotifyClientSecret}`).toString('base64')}`;
 }
@@ -468,7 +481,13 @@ spotifyApi.get('/spotify/connect/start', (req, res) => {
       'playlist-read-private',
       'playlist-read-collaborative',
       'user-library-read',
+      'user-read-private',
       'user-read-recently-played',
+      'user-read-playback-state',
+      'user-read-currently-playing',
+      'user-modify-playback-state',
+      'streaming',
+      'app-remote-control',
     ].join(' ');
 
     const authorizeUrl = new URL('https://accounts.spotify.com/authorize');
@@ -547,7 +566,55 @@ spotifyApi.get('/spotify/connect/status', async (req, res) => {
     return res.status(500).json({ error: message });
   }
 });
+spotifyApi.get('/spotify/connect/access-token', async (req, res) => {
+  const sessionId = String(req.query.sessionId || '').trim();
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing sessionId query parameter' });
+  }
+  try {
+    const accessToken = await getUserAccessToken(sessionId);
+    return res.json({
+      sessionId,
+      accessToken,
+      tokenType: 'Bearer',
+      clientId: spotifyClientId,
+      redirectUri: `${baseUrl}/spotify/connect/callback`,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return res.status(error.statusCode || 500).json({ error: message });
+  }
+});
 
+spotifyApi.get('/spotify/me/profile', async (req, res) => {
+  try {
+    const sessionId = String(req.query.sessionId || '').trim();
+    const payload = await userSpotifyGetJson(
+      sessionId,
+      '/me?fields=id,display_name,images(url)',
+    );
+    const id = (payload?.id || '').trim();
+    const displayName = (payload?.display_name || '').trim();
+    let imageUrl = firstSpotifyImageUrl(payload?.images);
+    if (!imageUrl && id) {
+      try {
+        const publicProfile = await userSpotifyGetJson(
+          sessionId,
+          `/users/${encodeURIComponent(id)}?fields=images(url)`,
+        );
+        imageUrl = firstSpotifyImageUrl(publicProfile?.images);
+      } catch (_) {}
+    }
+    return res.json({
+      id,
+      displayName,
+      imageUrl,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return res.status(error.statusCode || 500).json({ error: message });
+  }
+});
 spotifyApi.post('/spotify/connect/disconnect', async (req, res) => {
   const sessionId = String(req.body?.sessionId || '').trim();
   if (!sessionId) {

@@ -7,6 +7,9 @@ import 'package:firebase_core/firebase_core.dart';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:spotify_sdk/models/player_state.dart';
+import 'package:spotify_sdk/models/track.dart';
+import 'package:spotify_sdk/spotify_sdk.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
 
@@ -43,6 +46,20 @@ Map<String, dynamic>? _asStringKeyedMap(Object? value) {
       (Object? key, Object? mappedValue) =>
           MapEntry<String, dynamic>(key.toString(), mappedValue),
     );
+  }
+  return null;
+}
+
+String? _firstSpotifyImageUrl(Object? rawImages) {
+  if (rawImages is! List) {
+    return null;
+  }
+  for (final Object? rawImage in rawImages) {
+    final Map<String, dynamic>? image = _asStringKeyedMap(rawImage);
+    final String url = (image?['url'] as String? ?? '').trim();
+    if (url.isNotEmpty) {
+      return url;
+    }
   }
   return null;
 }
@@ -101,6 +118,14 @@ const String _spotifyBackendBaseUrl = String.fromEnvironment(
   'SPOTIFY_BACKEND_BASE_URL',
   defaultValue: 'https://tv.lull.works',
 );
+const String _spotifySdkClientId = String.fromEnvironment(
+  'SPOTIFY_SDK_CLIENT_ID',
+  defaultValue: '',
+);
+const String _spotifySdkRedirectUri = String.fromEnvironment(
+  'SPOTIFY_SDK_REDIRECT_URI',
+  defaultValue: '',
+);
 
 class _SpotifyImportTrack {
   const _SpotifyImportTrack({
@@ -130,6 +155,36 @@ class _SpotifyImportTrack {
       spotifyTrackId: (json['spotifyTrackId'] as String? ?? '').trim(),
       spotifyUri: (json['spotifyUri'] as String? ?? '').trim(),
       artworkUrl: (json['artworkUrl'] as String?)?.trim(),
+    );
+  }
+}
+
+class _SpotifyPlaybackToken {
+  const _SpotifyPlaybackToken({
+    required this.accessToken,
+    required this.clientId,
+    required this.redirectUri,
+  });
+
+  final String accessToken;
+  final String clientId;
+  final String redirectUri;
+
+  factory _SpotifyPlaybackToken.fromJson(Map<String, dynamic> json) {
+    final String accessToken = (json['accessToken'] as String? ?? '').trim();
+    final String serverClientId = (json['clientId'] as String? ?? '').trim();
+    final String serverRedirectUri = (json['redirectUri'] as String? ?? '')
+        .trim();
+    final String clientId = _spotifySdkClientId.isEmpty
+        ? serverClientId
+        : _spotifySdkClientId.trim();
+    final String redirectUri = _spotifySdkRedirectUri.isEmpty
+        ? serverRedirectUri
+        : _spotifySdkRedirectUri.trim();
+    return _SpotifyPlaybackToken(
+      accessToken: accessToken,
+      clientId: clientId,
+      redirectUri: redirectUri,
     );
   }
 }
@@ -173,6 +228,25 @@ String _formatRuntime(int seconds) {
   final int minutes = seconds ~/ 60;
   final int remainingSeconds = seconds % 60;
   return '${minutes}m ${remainingSeconds.toString().padLeft(2, '0')}s';
+}
+
+String? _spotifyImageUriToUrl(String? imageUriRaw) {
+  final String raw = (imageUriRaw ?? '').trim();
+  if (raw.isEmpty) {
+    return null;
+  }
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw;
+  }
+  const String prefix = 'spotify:image:';
+  if (!raw.startsWith(prefix)) {
+    return null;
+  }
+  final String imageId = raw.substring(prefix.length).trim();
+  if (imageId.isEmpty) {
+    return null;
+  }
+  return 'https://i.scdn.co/image/$imageId';
 }
 
 Future<void> main() async {
@@ -366,9 +440,35 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   int _tabIndex = 0;
   bool _isLoading = true;
   String? _firebaseUserId;
+  bool _spotifyAccountConnected = false;
+  bool _isLinkingSpotify = false;
+  String? _spotifyProfileName;
+  String? _spotifyProfileImageUrl;
+  bool _spotifyPlayerReady = false;
+  bool _isPlayerConnecting = false;
+  PlayerState? _spotifyPlayerState;
+  String? _spotifyPlayerErrorMessage;
+  StreamSubscription<PlayerState>? _spotifyPlayerStateSubscription;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
       _setlistSubscription;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _songsSubscription;
+
+  String? get _spotifySessionId {
+    final String trimmed = (_firebaseUserId ?? '').trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    return trimmed;
+  }
+
+  Uri _backendUri(
+    String path, {
+    Map<String, String> queryParameters = const <String, String>{},
+  }) {
+    return Uri.parse('$_spotifyBackendBaseUrl$path').replace(
+      queryParameters: queryParameters,
+    );
+  }
 
   DocumentReference<Map<String, dynamic>>? get _setlistDoc {
     final String? userId = _firebaseUserId;
@@ -442,6 +542,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
 
   @override
   void dispose() {
+    unawaited(_spotifyPlayerStateSubscription?.cancel());
     unawaited(_setlistSubscription?.cancel());
     unawaited(_songsSubscription?.cancel());
     super.dispose();
@@ -458,6 +559,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       }
 
       _firebaseUserId = user.uid;
+      await _syncSpotifyConnectionStatus();
       await _ensureCloudSetlistExists();
       await _setlistSubscription?.cancel();
       await _songsSubscription?.cancel();
@@ -526,6 +628,339 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         _isLoading = false;
       });
     }
+  }
+
+  Future<void> _syncSpotifyConnectionStatus() async {
+    final String? sessionId = _spotifySessionId;
+    if (sessionId == null) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyAccountConnected = false;
+        _spotifyProfileName = null;
+        _spotifyProfileImageUrl = null;
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+        _spotifyPlayerErrorMessage = null;
+      });
+      return;
+    }
+    final http.Response response = await http.get(
+      _backendUri(
+        '/spotify/connect/status',
+        queryParameters: <String, String>{'sessionId': sessionId},
+      ),
+      headers: const <String, String>{'Accept': 'application/json'},
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw const FormatException('Failed to read Spotify connection status');
+    }
+    final Map<String, dynamic>? payload = _asStringKeyedMap(
+      jsonDecode(response.body),
+    );
+    final bool connected = payload?['connected'] == true;
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _spotifyAccountConnected = connected;
+      if (!connected) {
+        _spotifyProfileName = null;
+        _spotifyProfileImageUrl = null;
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+        _spotifyPlayerErrorMessage = null;
+      }
+    });
+    if (connected) {
+      await _loadSpotifyProfile();
+    }
+  }
+
+  Future<void> _loadSpotifyProfile() async {
+    final String? sessionId = _spotifySessionId;
+    if (sessionId == null) {
+      return;
+    }
+    final http.Response response = await http.get(
+      _backendUri(
+        '/spotify/me/profile',
+        queryParameters: <String, String>{'sessionId': sessionId},
+      ),
+      headers: const <String, String>{'Accept': 'application/json'},
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return;
+    }
+    final Map<String, dynamic>? payload = _asStringKeyedMap(
+      jsonDecode(response.body),
+    );
+    final String displayName = (payload?['displayName'] as String? ?? '')
+        .trim();
+    final String fallbackName = (payload?['id'] as String? ?? '').trim();
+    final Object? rawImageUrl = payload?['imageUrl'];
+    final String imageUrlValue = rawImageUrl is String ? rawImageUrl.trim() : '';
+    final String? imageUrl = imageUrlValue.isNotEmpty
+        ? imageUrlValue
+        : _firstSpotifyImageUrl(payload?['images']);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _spotifyProfileName = displayName.isNotEmpty ? displayName : fallbackName;
+      _spotifyProfileImageUrl = (imageUrl ?? '').isEmpty ? null : imageUrl;
+    });
+  }
+
+  Future<void> _connectSpotifyAccount() async {
+    if (_isLinkingSpotify) {
+      return;
+    }
+    final String? sessionId = _spotifySessionId;
+    if (sessionId == null) {
+      return;
+    }
+    setState(() {
+      _isLinkingSpotify = true;
+    });
+    try {
+      final http.Response response = await http.get(
+        _backendUri(
+          '/spotify/connect/start',
+          queryParameters: <String, String>{'sessionId': sessionId},
+        ),
+        headers: const <String, String>{'Accept': 'application/json'},
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw const FormatException('Spotify connect start failed');
+      }
+      final Map<String, dynamic>? payload = _asStringKeyedMap(
+        jsonDecode(response.body),
+      );
+      final String authorizeUrl = (payload?['authorizeUrl'] as String? ?? '')
+          .trim();
+      if (authorizeUrl.isEmpty) {
+        throw const FormatException('Spotify authorize URL missing');
+      }
+      final bool opened = await launchUrl(
+        Uri.parse(authorizeUrl),
+        mode: LaunchMode.externalApplication,
+      );
+      if (!opened) {
+        throw const FormatException('Could not open Spotify authorization URL');
+      }
+      final DateTime start = DateTime.now();
+      while (DateTime.now().difference(start).inSeconds < 90) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        await _syncSpotifyConnectionStatus();
+        if (!mounted) {
+          return;
+        }
+        if (_spotifyAccountConnected) {
+          return;
+        }
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerErrorMessage = 'Spotify connection failed.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLinkingSpotify = false;
+        });
+      }
+    }
+  }
+
+  String? _trackIdFromSpotifyUri(String? spotifyUri) {
+    final List<String> parts = (spotifyUri ?? '').trim().split(':');
+    if (parts.length < 3) {
+      return null;
+    }
+    final String type = parts[1].trim().toLowerCase();
+    if (type != 'track') {
+      return null;
+    }
+    final String trackId = parts[2].trim();
+    if (trackId.isEmpty) {
+      return null;
+    }
+    return trackId;
+  }
+
+  String? _spotifyUriForSong(Song song) {
+    final String directUri = (song.spotifyUri ?? '').trim();
+    if (directUri.isNotEmpty) {
+      return directUri;
+    }
+    final String trackId = (song.spotifyTrackId ?? '').trim();
+    if (trackId.isEmpty) {
+      return null;
+    }
+    return 'spotify:track:$trackId';
+  }
+
+  Future<_SpotifyPlaybackToken> _fetchSpotifyPlaybackToken() async {
+    final String? sessionId = _spotifySessionId;
+    if (sessionId == null) {
+      throw const FormatException('Missing Spotify session ID');
+    }
+    final http.Response response = await http.get(
+      _backendUri(
+        '/spotify/connect/access-token',
+        queryParameters: <String, String>{'sessionId': sessionId},
+      ),
+      headers: const <String, String>{'Accept': 'application/json'},
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw const FormatException('Failed to fetch Spotify playback token');
+    }
+    final Map<String, dynamic>? payload = _asStringKeyedMap(
+      jsonDecode(response.body),
+    );
+    if (payload == null) {
+      throw const FormatException('Spotify playback token payload missing');
+    }
+    final _SpotifyPlaybackToken token = _SpotifyPlaybackToken.fromJson(payload);
+    if (token.accessToken.isEmpty ||
+        token.clientId.isEmpty ||
+        token.redirectUri.isEmpty) {
+      throw const FormatException('Spotify playback token response incomplete');
+    }
+    return token;
+  }
+
+  Future<void> _ensureSpotifyPlayerConnected() async {
+    if (_spotifyPlayerReady || _isPlayerConnecting) {
+      return;
+    }
+    setState(() {
+      _isPlayerConnecting = true;
+      _spotifyPlayerErrorMessage = null;
+    });
+    try {
+      final _SpotifyPlaybackToken token = await _fetchSpotifyPlaybackToken();
+      final bool connected = await SpotifySdk.connectToSpotifyRemote(
+        clientId: token.clientId,
+        redirectUrl: token.redirectUri,
+        accessToken: token.accessToken,
+      );
+      if (!connected) {
+        throw const FormatException('Could not connect to Spotify remote');
+      }
+      await _spotifyPlayerStateSubscription?.cancel();
+      _spotifyPlayerStateSubscription = SpotifySdk.subscribePlayerState().listen(
+        (PlayerState state) {
+          if (!mounted) {
+            return;
+          }
+          final String? activeTrackId = _trackIdFromSpotifyUri(
+            state.track?.uri,
+          );
+          String? nextCurrentSongId = _currentSongId;
+          if (activeTrackId != null) {
+            final Song? matchingSong = _songs.cast<Song?>().firstWhere(
+              (Song? song) =>
+                  (song?.spotifyTrackId ?? '').trim() == activeTrackId,
+              orElse: () => null,
+            );
+            if (matchingSong != null) {
+              nextCurrentSongId = matchingSong.id;
+            }
+          }
+          setState(() {
+            _spotifyPlayerState = state;
+            _spotifyPlayerReady = true;
+            _currentSongId = nextCurrentSongId;
+          });
+        },
+        onError: (Object _) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _spotifyPlayerReady = false;
+            _spotifyPlayerState = null;
+          });
+        },
+      );
+      final PlayerState? state = await SpotifySdk.getPlayerState();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerReady = true;
+        _spotifyPlayerState = state;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+        _spotifyPlayerErrorMessage =
+            'Spotify playback unavailable. Reconnect Spotify and ensure Spotify app is open.';
+      });
+      rethrow;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPlayerConnecting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _playSongInMiniPlayer(Song song) async {
+    final String? spotifyUri = _spotifyUriForSong(song);
+    if (spotifyUri == null) {
+      setState(() {
+        _spotifyPlayerErrorMessage = 'Song has no playable Spotify track id.';
+      });
+      return;
+    }
+    try {
+      await _ensureSpotifyPlayerConnected();
+      await SpotifySdk.play(spotifyUri: spotifyUri);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _spotifyPlayerErrorMessage = null;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _toggleMiniPlayerPlayback() async {
+    try {
+      await _ensureSpotifyPlayerConnected();
+      final bool isPaused = _spotifyPlayerState?.isPaused ?? true;
+      if (isPaused) {
+        await SpotifySdk.resume();
+      } else {
+        await SpotifySdk.pause();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _skipMiniPlayerNext() async {
+    try {
+      await _ensureSpotifyPlayerConnected();
+      await SpotifySdk.skipNext();
+    } catch (_) {}
+  }
+
+  Future<void> _skipMiniPlayerPrevious() async {
+    try {
+      await _ensureSpotifyPlayerConnected();
+      await SpotifySdk.skipPrevious();
+    } catch (_) {}
   }
 
   Future<void> _ensureCloudSetlistExists() async {
@@ -730,19 +1165,6 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     _setCurrentSong(_songs[nextIndex].id);
   }
 
-  Future<void> _openSpotify(String spotifyUrl) async {
-    final Uri? uri = Uri.tryParse(spotifyUrl.trim());
-    if (uri == null) {
-      return;
-    }
-    final bool opened = await launchUrl(
-      uri,
-      mode: LaunchMode.externalApplication,
-    );
-    if (!opened || !mounted) {
-      return;
-    }
-  }
 
   Future<void> _showSongPickerModal() async {
     if (_songs.isEmpty) {
@@ -836,6 +1258,30 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final Widget? topBarTrailing = _spotifyAccountConnected
+        ? null
+        : (_spotifySessionId == null
+              ? const _TopStatusTag(
+                  text: 'Preparing account',
+                  icon: Icons.hourglass_top_rounded,
+                )
+              : FilledButton.tonalIcon(
+                  onPressed: _isLinkingSpotify ? null : _connectSpotifyAccount,
+                  icon: _isLinkingSpotify
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.link_rounded),
+                  label: Text(
+                    _isLinkingSpotify ? 'Connecting...' : 'Connect Spotify',
+                  ),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _appPrimary,
+                    foregroundColor: const Color(0xFF161616),
+                  ),
+                ));
     final Widget bodyContent;
     if (_isLoading) {
       bodyContent = const Center(
@@ -851,10 +1297,14 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         onNextSong: () => _stepCurrentSong(1),
         onSelectSong: _setCurrentSong,
         onRemoveSong: _removeSong,
-        onOpenSpotify: _openSpotify,
+        onPlaySpotify: _playSongInMiniPlayer,
       );
     } else {
-      bodyContent = _SongImporterPage(onSongsImported: _upsertImportedSongs);
+      bodyContent = _SongImporterPage(
+        onSongsImported: _upsertImportedSongs,
+        spotifySessionId: _spotifySessionId,
+        spotifyAccountConnected: _spotifyAccountConnected,
+      );
     }
 
     return Scaffold(
@@ -872,15 +1322,48 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         ),
         child: SafeArea(
           bottom: false,
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 220),
-            child: bodyContent,
+          child: Column(
+            children: <Widget>[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
+                child: _TopStatusBar(
+                  title: 'Tallarines Verdes',
+                  subtitle:
+                      _spotifyAccountConnected &&
+                          (_spotifyProfileName ?? '').trim().isNotEmpty
+                      ? _spotifyProfileName!.trim()
+                      : 'Band setlist companion',
+                  imageUrl: _spotifyAccountConnected ? _spotifyProfileImageUrl : null,
+                  trailing: topBarTrailing,
+                ),
+              ),
+              Expanded(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 220),
+                  child: bodyContent,
+                ),
+              ),
+            ],
           ),
         ),
       ),
-      bottomNavigationBar: _BottomActionBar(
-        activeIndex: _tabIndex,
-        onActionPressed: _selectBottomAction,
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          if (_spotifyAccountConnected)
+            _SpotifyMiniPlayerBar(
+              playerState: _spotifyPlayerState,
+              isConnecting: _isPlayerConnecting,
+              errorMessage: _spotifyPlayerErrorMessage,
+              onPlayPausePressed: _toggleMiniPlayerPlayback,
+              onPreviousPressed: _skipMiniPlayerPrevious,
+              onNextPressed: _skipMiniPlayerNext,
+            ),
+          _BottomActionBar(
+            activeIndex: _tabIndex,
+            onActionPressed: _selectBottomAction,
+          ),
+        ],
       ),
     );
   }
@@ -897,7 +1380,7 @@ class SetlistPage extends StatelessWidget {
     required this.onNextSong,
     required this.onSelectSong,
     required this.onRemoveSong,
-    required this.onOpenSpotify,
+    required this.onPlaySpotify,
   });
 
   final List<Song> songs;
@@ -908,7 +1391,7 @@ class SetlistPage extends StatelessWidget {
   final VoidCallback onNextSong;
   final ValueChanged<String> onSelectSong;
   final ValueChanged<String> onRemoveSong;
-  final Future<void> Function(String spotifyUrl) onOpenSpotify;
+  final Future<void> Function(Song song) onPlaySpotify;
 
   @override
   Widget build(BuildContext context) {
@@ -917,8 +1400,6 @@ class SetlistPage extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          const _SectionLabel(text: 'Band Setlist Companion'),
-          const SizedBox(height: 10),
           const Text(
             'Tallarines Verdes',
             style: TextStyle(
@@ -1080,10 +1561,9 @@ class SetlistPage extends StatelessWidget {
                         SizedBox(
                           width: double.infinity,
                           child: FilledButton.icon(
-                            onPressed: () =>
-                                onOpenSpotify(currentSong!.spotifyUrl),
-                            icon: const Icon(Icons.open_in_new_rounded),
-                            label: const Text('Open in Spotify'),
+                            onPressed: () => onPlaySpotify(currentSong!),
+                            icon: const Icon(Icons.play_arrow_rounded),
+                            label: const Text('Play in app'),
                             style: FilledButton.styleFrom(
                               backgroundColor: _appPrimary,
                               foregroundColor: const Color(0xFF171717),
@@ -1222,16 +1702,15 @@ class SetlistPage extends StatelessWidget {
                             Column(
                               children: <Widget>[
                                 IconButton(
-                                  icon: const Icon(Icons.play_arrow_rounded),
+                                  icon: const Icon(Icons.radio_button_checked_rounded),
                                   tooltip: 'Set as current song',
                                   onPressed: () => onSelectSong(song.id),
                                 ),
                                 if (song.spotifyUrl.trim().isNotEmpty)
                                   IconButton(
-                                    icon: const Icon(Icons.open_in_new_rounded),
-                                    tooltip: 'Open in Spotify',
-                                    onPressed: () =>
-                                        onOpenSpotify(song.spotifyUrl),
+                                    icon: const Icon(Icons.play_arrow_rounded),
+                                    tooltip: 'Play in app',
+                                    onPressed: () => onPlaySpotify(song),
                                   ),
                                 IconButton(
                                   icon: const Icon(
@@ -1275,9 +1754,15 @@ class _RoleDraft {
 }
 
 class _SongImporterPage extends StatefulWidget {
-  const _SongImporterPage({required this.onSongsImported});
+  const _SongImporterPage({
+    required this.onSongsImported,
+    required this.spotifySessionId,
+    required this.spotifyAccountConnected,
+  });
 
   final _ImportMergeResult Function(List<Song> songs) onSongsImported;
+  final String? spotifySessionId;
+  final bool spotifyAccountConnected;
 
   @override
   State<_SongImporterPage> createState() => _SongImporterPageState();
@@ -1302,13 +1787,20 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   SongSourceType _importSourceType = SongSourceType.manual;
   _ImportState _importState = _ImportState.idle;
   String _statusMessage = '';
-  String? _spotifySessionId;
-  bool _spotifyAccountConnected = false;
-  bool _isLinkingSpotify = false;
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_syncSpotifyConnectionStatus().catchError((Object _) {}));
+  String? get _spotifySessionId {
+    final String trimmed = (widget.spotifySessionId ?? '').trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    return trimmed;
+  }
+
+  String _requireSpotifySessionId() {
+    final String? sessionId = _spotifySessionId;
+    if (sessionId == null) {
+      throw const FormatException('Missing Spotify session ID');
+    }
+    return sessionId;
   }
 
   @override
@@ -1342,10 +1834,6 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     });
   }
 
-  String _sessionId() {
-    _spotifySessionId ??= _createId('spotify-session');
-    return _spotifySessionId!;
-  }
 
   Uri _backendUri(
     String path, {
@@ -1356,159 +1844,6 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     );
   }
 
-  Future<void> _syncSpotifyConnectionStatus() async {
-    final http.Response response = await http.get(
-      _backendUri(
-        '/spotify/connect/status',
-        queryParameters: <String, String>{'sessionId': _sessionId()},
-      ),
-      headers: <String, String>{'Accept': 'application/json'},
-    );
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw const FormatException('Failed to read Spotify connection status');
-    }
-    final Map<String, dynamic>? payload = _asStringKeyedMap(
-      jsonDecode(response.body),
-    );
-    final bool connected = payload?['connected'] == true;
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _spotifyAccountConnected = connected;
-    });
-  }
-
-  Future<void> _connectSpotifyAccount() async {
-    if (_isLinkingSpotify) {
-      return;
-    }
-    setState(() {
-      _isLinkingSpotify = true;
-      _importState = _ImportState.loading;
-      _statusMessage = 'Opening Spotify authorization...';
-    });
-
-    try {
-      final http.Response response = await http.get(
-        _backendUri(
-          '/spotify/connect/start',
-          queryParameters: <String, String>{'sessionId': _sessionId()},
-        ),
-        headers: <String, String>{'Accept': 'application/json'},
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw const FormatException('Spotify connect start failed');
-      }
-      final Map<String, dynamic>? payload = _asStringKeyedMap(
-        jsonDecode(response.body),
-      );
-      final String authorizeUrl = (payload?['authorizeUrl'] as String? ?? '')
-          .trim();
-      if (authorizeUrl.isEmpty) {
-        throw const FormatException('Spotify authorize URL missing');
-      }
-      final Uri authUri = Uri.parse(authorizeUrl);
-      final bool opened = await launchUrl(
-        authUri,
-        mode: LaunchMode.externalApplication,
-      );
-      if (!opened) {
-        throw const FormatException('Could not open Spotify authorization URL');
-      }
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _statusMessage =
-            'Complete Spotify login in the browser. Waiting for confirmation...';
-      });
-
-      final DateTime start = DateTime.now();
-      while (DateTime.now().difference(start).inSeconds < 90) {
-        await Future<void>.delayed(const Duration(seconds: 2));
-        final http.Response statusResponse = await http.get(
-          _backendUri(
-            '/spotify/connect/status',
-            queryParameters: <String, String>{'sessionId': _sessionId()},
-          ),
-          headers: <String, String>{'Accept': 'application/json'},
-        );
-        if (statusResponse.statusCode < 200 || statusResponse.statusCode >= 300) {
-          continue;
-        }
-        final Map<String, dynamic>? statusPayload = _asStringKeyedMap(
-          jsonDecode(statusResponse.body),
-        );
-        if (statusPayload?['connected'] == true) {
-          if (!mounted) {
-            return;
-          }
-          setState(() {
-            _spotifyAccountConnected = true;
-            _importState = _ImportState.success;
-            _statusMessage = 'Spotify account connected.';
-          });
-          return;
-        }
-      }
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _importState = _ImportState.error;
-        _statusMessage =
-            'Spotify connection timed out. Retry after completing browser login.';
-      });
-    } catch (_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _importState = _ImportState.error;
-        _statusMessage =
-            'Spotify connect failed. Verify backend is running and credentials are configured.';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isLinkingSpotify = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _disconnectSpotifyAccount() async {
-    try {
-      final http.Response response = await http.post(
-        _backendUri('/spotify/connect/disconnect'),
-        headers: <String, String>{
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode(<String, String>{'sessionId': _sessionId()}),
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw const FormatException('Spotify disconnect failed');
-      }
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _spotifyAccountConnected = false;
-        _importState = _ImportState.success;
-        _statusMessage = 'Spotify account disconnected.';
-      });
-    } catch (_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _importState = _ImportState.error;
-        _statusMessage = 'Could not disconnect Spotify account.';
-      });
-    }
-  }
 
   Future<List<_SpotifyImportTrack>> _importFromAccountEndpoint(
     String path, {
@@ -1516,7 +1851,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   }) async {
     final Map<String, String> fullQuery = <String, String>{
       ...queryParameters,
-      'sessionId': _sessionId(),
+      'sessionId': _requireSpotifySessionId(),
     };
     final http.Response response = await http.get(
       _backendUri(path, queryParameters: fullQuery),
@@ -1557,7 +1892,9 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     final http.Response response = await http.get(
       _backendUri(
         '/spotify/me/playlists',
-        queryParameters: <String, String>{'sessionId': _sessionId()},
+        queryParameters: <String, String>{
+          'sessionId': _requireSpotifySessionId(),
+        },
       ),
       headers: <String, String>{'Accept': 'application/json'},
     );
@@ -1609,18 +1946,199 @@ class _SongImporterPageState extends State<_SongImporterPage> {
           '$sourceLabel import complete: ${mergeResult.addedCount} added, ${mergeResult.updatedCount} updated.';
     });
   }
+  Future<List<_SpotifyImportTrack>?> _showTrackSelectionSheet({
+    required String title,
+    required List<_SpotifyImportTrack> tracks,
+  }) async {
+    return showModalBottomSheet<List<_SpotifyImportTrack>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _appSurfaceStrong,
+      showDragHandle: true,
+      builder: (BuildContext context) {
+        final Set<int> selectedIndexes = <int>{};
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setModalState) {
+            final int selectedCount = selectedIndexes.length;
+            return SafeArea(
+              child: SizedBox(
+                height: MediaQuery.of(context).size.height * 0.86,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '${tracks.length} songs available • $selectedCount selected',
+                        style: const TextStyle(color: _appMutedText),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: <Widget>[
+                          TextButton(
+                            onPressed: () {
+                              setModalState(() {
+                                selectedIndexes
+                                  ..clear()
+                                  ..addAll(
+                                    List<int>.generate(
+                                      tracks.length,
+                                      (int index) => index,
+                                    ),
+                                  );
+                              });
+                            },
+                            child: const Text('Select all'),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: () {
+                              setModalState(() {
+                                selectedIndexes.clear();
+                              });
+                            },
+                            child: const Text('Clear'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Expanded(
+                        child: tracks.isEmpty
+                            ? const Center(
+                                child: Text(
+                                  'No songs available for selection.',
+                                  style: TextStyle(color: _appMutedText),
+                                ),
+                              )
+                            : ListView.builder(
+                                itemCount: tracks.length,
+                                itemBuilder: (BuildContext context, int index) {
+                                  final _SpotifyImportTrack track = tracks[index];
+                                  final bool isSelected = selectedIndexes
+                                      .contains(index);
+                                  final String durationLabel =
+                                      track.duration.trim().isEmpty
+                                      ? ''
+                                      : ' • ${track.duration.trim()}';
+                                  return CheckboxListTile(
+                                    value: isSelected,
+                                    onChanged: (bool? value) {
+                                      setModalState(() {
+                                        if (value ?? false) {
+                                          selectedIndexes.add(index);
+                                        } else {
+                                          selectedIndexes.remove(index);
+                                        }
+                                      });
+                                    },
+                                    title: Text(track.title),
+                                    subtitle: Text(
+                                      '${track.artist}$durationLabel',
+                                      style: const TextStyle(
+                                        color: _appMutedText,
+                                      ),
+                                    ),
+                                    activeColor: _appPrimary,
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 4,
+                                    ),
+                                  );
+                                },
+                              ),
+                      ),
+                      const SizedBox(height: 10),
+                      FilledButton.icon(
+                        onPressed: selectedCount == 0
+                            ? null
+                            : () {
+                                final List<_SpotifyImportTrack> selectedTracks =
+                                    <_SpotifyImportTrack>[
+                                      for (
+                                        int i = 0;
+                                        i < tracks.length;
+                                        i += 1
+                                      )
+                                        if (selectedIndexes.contains(i))
+                                          tracks[i],
+                                    ];
+                                Navigator.of(context).pop(selectedTracks);
+                              },
+                        icon: const Icon(Icons.playlist_add_check_rounded),
+                        label: Text(
+                          selectedCount == 0
+                              ? 'Select songs to import'
+                              : 'Import $selectedCount selected',
+                        ),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _appPrimary,
+                          foregroundColor: const Color(0xFF171717),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _selectTracksAndImport({
+    required String selectionTitle,
+    required String sourceLabel,
+    required List<_SpotifyImportTrack> tracks,
+  }) async {
+    if (!mounted) {
+      return;
+    }
+    final List<_SpotifyImportTrack>? selectedTracks =
+        await _showTrackSelectionSheet(title: selectionTitle, tracks: tracks);
+    if (!mounted) {
+      return;
+    }
+    if (selectedTracks == null) {
+      setState(() {
+        _importState = _ImportState.idle;
+        _statusMessage = '';
+      });
+      return;
+    }
+    if (selectedTracks.isEmpty) {
+      setState(() {
+        _importState = _ImportState.error;
+        _statusMessage = 'Select at least one song to import.';
+      });
+      return;
+    }
+    _applyImportedTracks(selectedTracks, sourceLabel);
+  }
 
   Future<void> _importLikedSongs() async {
     setState(() {
       _importState = _ImportState.loading;
-      _statusMessage = 'Importing liked songs...';
+      _statusMessage = 'Loading liked songs...';
     });
     try {
       final List<_SpotifyImportTrack> tracks = await _importFromAccountEndpoint(
         '/spotify/me/liked-tracks',
         queryParameters: const <String, String>{'limit': '50'},
       );
-      _applyImportedTracks(tracks, 'Liked songs');
+      await _selectTracksAndImport(
+        selectionTitle: 'Select liked songs',
+        sourceLabel: 'Liked songs',
+        tracks: tracks,
+      );
     } catch (_) {
       if (!mounted) {
         return;
@@ -1635,14 +2153,18 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   Future<void> _importRecentlyPlayed() async {
     setState(() {
       _importState = _ImportState.loading;
-      _statusMessage = 'Importing recently played songs...';
+      _statusMessage = 'Loading recently played songs...';
     });
     try {
       final List<_SpotifyImportTrack> tracks = await _importFromAccountEndpoint(
         '/spotify/me/recently-played',
         queryParameters: const <String, String>{'limit': '50'},
       );
-      _applyImportedTracks(tracks, 'Recently played');
+      await _selectTracksAndImport(
+        selectionTitle: 'Select recently played songs',
+        sourceLabel: 'Recently played',
+        tracks: tracks,
+      );
     } catch (_) {
       if (!mounted) {
         return;
@@ -1709,13 +2231,17 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       }
       setState(() {
         _importState = _ImportState.loading;
-        _statusMessage = 'Importing playlist "${selectedPlaylist.name}"...';
+        _statusMessage = 'Loading songs from ${selectedPlaylist.name}...';
       });
       final List<_SpotifyImportTrack> tracks = await _importFromAccountEndpoint(
         '/spotify/me/playlist-tracks',
         queryParameters: <String, String>{'playlistId': selectedPlaylist.id},
       );
-      _applyImportedTracks(tracks, selectedPlaylist.name);
+      await _selectTracksAndImport(
+        selectionTitle: 'Select songs from ${selectedPlaylist.name}',
+        sourceLabel: selectedPlaylist.name,
+        tracks: tracks,
+      );
     } catch (_) {
       if (!mounted) {
         return;
@@ -2014,8 +2540,6 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          const _SectionLabel(text: 'Song Importer'),
-          const SizedBox(height: 10),
           const Text(
             'Import + Add Song',
             style: TextStyle(
@@ -2075,39 +2599,6 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 10),
-                Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed:
-                            _isLinkingSpotify || _importState == _ImportState.loading
-                            ? null
-                            : _spotifyAccountConnected
-                            ? _disconnectSpotifyAccount
-                            : _connectSpotifyAccount,
-                        icon: Icon(
-                          _spotifyAccountConnected
-                              ? Icons.link_off_rounded
-                              : Icons.link_rounded,
-                        ),
-                        label: Text(
-                          _spotifyAccountConnected
-                              ? 'Disconnect Spotify'
-                              : (_isLinkingSpotify
-                                    ? 'Connecting...'
-                                    : 'Connect Spotify'),
-                        ),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: BorderSide(
-                            color: Colors.white.withValues(alpha: 0.2),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 8,
@@ -2115,7 +2606,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                   children: <Widget>[
                     FilledButton.tonalIcon(
                       onPressed:
-                          (!_spotifyAccountConnected ||
+                          (_spotifySessionId == null ||
+                              !widget.spotifyAccountConnected ||
                               _importState == _ImportState.loading)
                           ? null
                           : _importFromMyPlaylists,
@@ -2124,7 +2616,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                     ),
                     FilledButton.tonalIcon(
                       onPressed:
-                          (!_spotifyAccountConnected ||
+                          (_spotifySessionId == null ||
+                              !widget.spotifyAccountConnected ||
                               _importState == _ImportState.loading)
                           ? null
                           : _importLikedSongs,
@@ -2133,7 +2626,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                     ),
                     FilledButton.tonalIcon(
                       onPressed:
-                          (!_spotifyAccountConnected ||
+                          (_spotifySessionId == null ||
+                              !widget.spotifyAccountConnected ||
                               _importState == _ImportState.loading)
                           ? null
                           : _importRecentlyPlayed,
@@ -2314,6 +2808,269 @@ class _SongImporterPageState extends State<_SongImporterPage> {
             style: TextStyle(color: _appMutedText, fontSize: 12),
           ),
           const SizedBox(height: 84),
+        ],
+      ),
+    );
+  }
+}
+
+class _TopStatusBar extends StatelessWidget {
+  const _TopStatusBar({
+    required this.title,
+    required this.subtitle,
+    this.imageUrl,
+    this.trailing,
+  });
+
+  final String title;
+  final String subtitle;
+  final String? imageUrl;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: <Widget>[
+        _ProfileAvatar(imageUrl: imageUrl),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                title,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 14,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: const TextStyle(color: _appMutedText, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+        if (trailing != null) ...<Widget>[
+          const SizedBox(width: 10),
+          Flexible(
+            child: Align(alignment: Alignment.centerRight, child: trailing!),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _TopStatusTag extends StatelessWidget {
+  const _TopStatusTag({required this.text, required this.icon});
+
+  final String text;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: _appSurfaceStrong,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(icon, size: 14, color: _appPrimary),
+          const SizedBox(width: 6),
+          Text(
+            text,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: _appMutedText,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProfileAvatar extends StatelessWidget {
+  const _ProfileAvatar({this.imageUrl});
+
+  final String? imageUrl;
+  static const String _fallbackAvatarUrl =
+      'https://api.dicebear.com/9.x/notionists/png?seed=TallarinesVerdes';
+
+  @override
+  Widget build(BuildContext context) {
+    final String resolvedImageUrl = (imageUrl ?? '').trim();
+    return CircleAvatar(
+      radius: 20,
+      backgroundColor: _appSurfaceStrong,
+      backgroundImage: const NetworkImage(_fallbackAvatarUrl),
+      foregroundImage: resolvedImageUrl.isEmpty ? null : NetworkImage(resolvedImageUrl),
+      child: resolvedImageUrl.isEmpty
+          ? const Icon(Icons.person_rounded, color: Colors.white)
+          : null,
+    );
+  }
+}
+
+class _SpotifyMiniPlayerBar extends StatelessWidget {
+  const _SpotifyMiniPlayerBar({
+    required this.playerState,
+    required this.isConnecting,
+    required this.errorMessage,
+    required this.onPlayPausePressed,
+    required this.onPreviousPressed,
+    required this.onNextPressed,
+  });
+
+  final PlayerState? playerState;
+  final bool isConnecting;
+  final String? errorMessage;
+  final Future<void> Function() onPlayPausePressed;
+  final Future<void> Function() onPreviousPressed;
+  final Future<void> Function() onNextPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final Track? track = playerState?.track;
+    final String title = (track?.name ?? '').trim();
+    final String artistName = (track?.artist.name ?? '').trim();
+    final bool isPaused = playerState?.isPaused ?? true;
+    final String? artworkUrl = _spotifyImageUriToUrl(track?.imageUri.raw);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121212),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: artworkUrl == null
+                    ? Container(
+                        width: 48,
+                        height: 48,
+                        color: _appSurfaceStrong,
+                        alignment: Alignment.center,
+                        child: const Icon(
+                          Icons.music_note_rounded,
+                          color: _appMutedText,
+                        ),
+                      )
+                    : Image.network(
+                        artworkUrl,
+                        width: 48,
+                        height: 48,
+                        fit: BoxFit.cover,
+                        errorBuilder: (
+                          BuildContext context,
+                          Object error,
+                          StackTrace? stackTrace,
+                        ) {
+                          return Container(
+                            width: 48,
+                            height: 48,
+                            color: _appSurfaceStrong,
+                            alignment: Alignment.center,
+                            child: const Icon(
+                              Icons.music_note_rounded,
+                              color: _appMutedText,
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      title.isEmpty ? 'No song playing' : title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      artistName.isEmpty ? 'Spotify mini player' : artistName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: _appMutedText, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                onPressed: isConnecting
+                    ? null
+                    : () {
+                        unawaited(onPreviousPressed());
+                      },
+                icon: const Icon(Icons.skip_previous_rounded),
+                tooltip: 'Previous',
+              ),
+              IconButton(
+                onPressed: isConnecting
+                    ? null
+                    : () {
+                        unawaited(onPlayPausePressed());
+                      },
+                icon: isConnecting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Icon(
+                        isPaused
+                            ? Icons.play_circle_fill_rounded
+                            : Icons.pause_circle_filled_rounded,
+                      ),
+                tooltip: isPaused ? 'Play' : 'Pause',
+              ),
+              IconButton(
+                onPressed: isConnecting
+                    ? null
+                    : () {
+                        unawaited(onNextPressed());
+                      },
+                icon: const Icon(Icons.skip_next_rounded),
+                tooltip: 'Next',
+              ),
+            ],
+          ),
+          if ((errorMessage ?? '').trim().isNotEmpty) ...<Widget>[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                errorMessage!.trim(),
+                style: const TextStyle(
+                  color: Color(0xFFFF9A9A),
+                  fontSize: 11,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
