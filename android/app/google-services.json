@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "686395484165",
+    "project_id": "tallerines-verdes",
+    "storage_bucket": "tallerines-verdes.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:686395484165:android:4ff8dbe3e23da2027c146c",
+        "android_client_info": {
+          "package_name": "com.tallarinesverdes.tallarines_verdes_flutter"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDXOqCGj1g_ehQYqPyJfK_s-92TeeTirYo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

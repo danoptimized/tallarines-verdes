@@ -1,0 +1,43 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "tallerines-verdes",
+          "appId": "1:686395484165:android:4ff8dbe3e23da2027c146c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "tallerines-verdes",
+          "appId": "1:686395484165:ios:bec063b4ce12d7b17c146c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "macos": {
+        "default": {
+          "projectId": "tallerines-verdes",
+          "appId": "1:686395484165:ios:bec063b4ce12d7b17c146c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "macos/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "tallerines-verdes",
+          "configurations": {
+            "android": "1:686395484165:android:4ff8dbe3e23da2027c146c",
+            "ios": "1:686395484165:ios:bec063b4ce12d7b17c146c",
+            "macos": "1:686395484165:ios:bec063b4ce12d7b17c146c",
+            "web": "1:686395484165:web:a5ddde63685d07247c146c"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
