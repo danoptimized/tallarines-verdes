@@ -31,8 +31,26 @@
 
   <title>tallarines_verdes_flutter</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    html, body {
+      background: #000000;
+      margin: 0;
+      height: 100%;
+    }
+  </style>
 </head>
 <body>
+  <picture id="splash">
+    <img src="splash_icon.png" alt="" style="position:fixed;inset:0;margin:auto;width:168px;height:168px;">
+  </picture>
+  <script>
+    window.addEventListener('flutter-first-frame', function () {
+      const splash = document.getElementById('splash');
+      if (splash) {
+        splash.remove();
+      }
+    });
+  </script>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader

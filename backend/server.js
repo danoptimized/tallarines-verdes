@@ -166,6 +166,7 @@ function normalizePlaylist(playlist) {
     tracksTotal: Number(
       playlist?.items?.total ?? playlist?.tracks?.total ?? 0,
     ),
+    artworkUrl: firstSpotifyImageUrl(playlist?.images),
   };
 }
 
@@ -176,7 +177,7 @@ function trackFromPlaylistItem(entry) {
 async function fetchUserPlaylistsPage(sessionId, offset, limit) {
   const paths = [
     `/me/playlists?limit=${limit}&offset=${offset}`,
-    `/me/playlists?limit=${limit}&offset=${offset}&fields=items(id,name,items(total),tracks(total)),next`,
+    `/me/playlists?limit=${limit}&offset=${offset}&fields=items(id,name,images(url),items(total),tracks(total)),next`,
   ];
 
   let lastError;
@@ -271,6 +272,16 @@ async function collectPlaylistTracks(
   }
 
   return tracks;
+}
+
+async function fetchPlaylistById(playlistId, accessToken, sessionId) {
+  const path =
+    `/playlists/${encodeURIComponent(playlistId)}` +
+    '?fields=id,name,images(url),items(total),tracks(total)';
+  const payload = sessionId
+    ? await userSpotifyGetJson(sessionId, path)
+    : await spotifyGetJson(path, accessToken);
+  return normalizePlaylist(payload);
 }
 
 function firstSpotifyImageUrl(images) {
@@ -763,8 +774,12 @@ spotifyApi.get('/spotify/import-url', async (req, res) => {
 
     const playlistId = spotifyEntityIdFromUrl(spotifyUrl, 'playlist');
     if (playlistId) {
-      const tracks = await importPlaylistByIdWithAppToken(playlistId);
-      return res.json({ tracks });
+      const appToken = await getSpotifyAccessToken();
+      const [tracks, playlist] = await Promise.all([
+        importPlaylistByIdWithAppToken(playlistId),
+        fetchPlaylistById(playlistId, appToken),
+      ]);
+      return res.json({ tracks, playlist });
     }
 
     return res.status(400).json({

@@ -25,9 +25,20 @@ const Color _appAccent = Color(0xFF5D4A8A);
 // Shared geometry between _CurrentSongBar and _BottomActionBar so the
 // current-song outline lines up exactly with the "Current Song" tab.
 const double _bottomNavHorizontalPadding = 8;
+const double _bottomNavTabHorizontalInset = 10;
 const double _bottomNavOuterCornerRadius = 20;
 const double _connectedOutlineWidth = 1.5;
 const int _bottomNavTabCount = 3;
+
+double _currentSongTabLeft(double barWidth) {
+  final double tabRowWidth = barWidth - _bottomNavHorizontalPadding;
+  final double tabCellWidth = tabRowWidth / _bottomNavTabCount;
+  return _bottomNavHorizontalPadding +
+      (tabCellWidth * (_bottomNavTabCount - 1)) +
+      _bottomNavTabHorizontalInset;
+}
+
+double _currentSongTabRight(double barWidth) => barWidth;
 const List<String> _editableInstrumentOptions = <String>[
   'Guitar',
   'Drums',
@@ -434,6 +445,56 @@ class _SpotifyImportTrack {
   }
 }
 
+class _ImportArtworkThumbnail extends StatelessWidget {
+  const _ImportArtworkThumbnail({
+    required this.artworkUrl,
+    this.size = 48,
+  });
+
+  final String? artworkUrl;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final String resolvedArtworkUrl = (artworkUrl ?? '').trim();
+    final Widget fallback = Container(
+      color: _appSurface,
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.queue_music_rounded,
+        size: size * 0.42,
+        color: Colors.white.withValues(alpha: 0.7),
+      ),
+    );
+
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(7),
+        child: resolvedArtworkUrl.isEmpty
+            ? fallback
+            : Image.network(
+                resolvedArtworkUrl,
+                fit: BoxFit.cover,
+                errorBuilder:
+                    (
+                      BuildContext context,
+                      Object error,
+                      StackTrace? stackTrace,
+                    ) {
+                      return fallback;
+                    },
+              ),
+      ),
+    );
+  }
+}
+
 class _SongArtworkThumbnail extends StatelessWidget {
   const _SongArtworkThumbnail({
     required this.artworkUrl,
@@ -573,11 +634,13 @@ class _SpotifyPlaylistSummary {
     required this.id,
     required this.name,
     required this.tracksTotal,
+    this.artworkUrl,
   });
 
   final String id;
   final String name;
   final int tracksTotal;
+  final String? artworkUrl;
 
   factory _SpotifyPlaylistSummary.fromJson(Map<String, dynamic> json) {
     String id = _asTrimmedString(json['id']);
@@ -619,10 +682,15 @@ class _SpotifyPlaylistSummary {
         _asInt(itemsMap?['total']) ??
         _asInt(tracksMap?['total']) ??
         nestedItemsCount;
+    final String artworkUrl = _asTrimmedString(json['artworkUrl']);
+    final String? resolvedArtworkUrl = artworkUrl.isNotEmpty
+        ? artworkUrl
+        : _firstSpotifyImageUrl(json['images']);
     return _SpotifyPlaylistSummary(
       id: id,
       name: name,
       tracksTotal: tracksTotal,
+      artworkUrl: resolvedArtworkUrl,
     );
   }
 }
@@ -2080,6 +2148,13 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: _StartupSplash(),
+      );
+    }
+
     final Widget? topBarTrailing = _spotifyAccountConnected
         ? null
         : (_spotifySessionId == null
@@ -2105,11 +2180,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
                   ),
                 ));
     final Widget bodyContent;
-    if (_isLoading) {
-      bodyContent = const Center(
-        child: CircularProgressIndicator(color: _appPrimary),
-      );
-    } else if (_tabIndex == 0) {
+    if (_tabIndex == 0) {
       bodyContent = _SongImporterPage(
         onSongsImported: _upsertImportedSongs,
         spotifySessionId: _spotifySessionId,
@@ -2137,6 +2208,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         onNextSong: () => _stepCurrentSong(1),
         onPlaySpotify: _playSongInMiniPlayer,
         onOpenSongPicker: _showSongPickerModal,
+        onEditSong: _editSong,
       );
     }
 
@@ -2220,6 +2292,23 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _StartupSplash extends StatelessWidget {
+  const _StartupSplash();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Image(
+        image: AssetImage('assets/splash/splash_icon.png'),
+        width: 168,
+        height: 168,
+        fit: BoxFit.contain,
+        filterQuality: FilterQuality.high,
       ),
     );
   }
@@ -2774,6 +2863,7 @@ class _CurrentSongPage extends StatelessWidget {
     required this.onNextSong,
     required this.onPlaySpotify,
     required this.onOpenSongPicker,
+    required this.onEditSong,
   });
 
   final Song? currentSong;
@@ -2783,6 +2873,7 @@ class _CurrentSongPage extends StatelessWidget {
   final VoidCallback onNextSong;
   final Future<void> Function(Song song) onPlaySpotify;
   final Future<void> Function() onOpenSongPicker;
+  final ValueChanged<Song> onEditSong;
 
   @override
   Widget build(BuildContext context) {
@@ -2971,6 +3062,21 @@ class _CurrentSongPage extends StatelessWidget {
                         ),
                       ],
                       const SizedBox(height: 14),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () => onEditSong(currentSong!),
+                          icon: const Icon(Icons.edit_rounded),
+                          label: const Text('Edit song'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            side: BorderSide(
+                              color: Colors.white.withValues(alpha: 0.15),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
                           Expanded(
@@ -3175,12 +3281,7 @@ class _EditSongPageState extends State<_EditSongPage> {
         continue;
       }
       if (instrument.isEmpty || player.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Each role needs both instrument and player.'),
-          ),
-        );
-        return;
+        continue;
       }
       roles.add(
         RoleAssignment(
@@ -3228,8 +3329,9 @@ class _EditSongPageState extends State<_EditSongPage> {
           ),
         ),
         child: SafeArea(
+          bottom: false,
           child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
@@ -3305,8 +3407,13 @@ class _EditSongPageState extends State<_EditSongPage> {
                           ),
                         ],
                       ),
-                      const SizedBox(height: 6),
-                      ..._roleDrafts.map((_RoleDraft roleDraft) {
+                      const SizedBox(height: 12),
+                      ..._roleDrafts.asMap().entries.map((
+                        MapEntry<int, _RoleDraft> entry,
+                      ) {
+                        final _RoleDraft roleDraft = entry.value;
+                        final bool isLastRole =
+                            entry.key == _roleDrafts.length - 1;
                         final String instrumentValue = roleDraft
                             .instrumentController
                             .text
@@ -3324,13 +3431,23 @@ class _EditSongPageState extends State<_EditSongPage> {
                             ? playerValue
                             : null;
                         return Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: <Widget>[
-                              Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: <Widget>[
+                          padding: EdgeInsets.only(bottom: isLastRole ? 0 : 20),
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: _appSurface.withValues(alpha: 0.35),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.06),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: <Widget>[
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: <Widget>[
                                   if (roleDraft.isPreset)
                                     SizedBox(
                                       width: 96,
@@ -3345,10 +3462,7 @@ class _EditSongPageState extends State<_EditSongPage> {
                                         isExpanded: true,
                                         initialValue: selectedInstrument,
                                         hint: const Text('Instrument'),
-                                        decoration: const InputDecoration(
-                                          labelText: 'Instrument',
-                                          isDense: true,
-                                        ),
+                                        decoration: _rolePillInputDecoration(),
                                         items: _editableInstrumentOptions
                                             .map((String option) {
                                               return DropdownMenuItem<String>(
@@ -3378,10 +3492,7 @@ class _EditSongPageState extends State<_EditSongPage> {
                                       isExpanded: true,
                                       initialValue: selectedPlayer,
                                       hint: const Text('Select player'),
-                                      decoration: const InputDecoration(
-                                        labelText: 'Player',
-                                        isDense: true,
-                                      ),
+                                      decoration: _rolePillInputDecoration(),
                                       items: _editablePlayerOptions
                                           .map((String option) {
                                             return DropdownMenuItem<String>(
@@ -3412,32 +3523,52 @@ class _EditSongPageState extends State<_EditSongPage> {
                                     ),
                                 ],
                               ),
-                              const SizedBox(height: 8),
+                              const SizedBox(height: 12),
                               TextField(
                                 controller: roleDraft.chartUrlController,
-                                decoration: const InputDecoration(
-                                  labelText: 'Chords/Tab link (optional)',
+                                decoration: _rolePillInputDecoration(
+                                  hintText:
+                                      'Chords/Tab link (optional)',
                                 ),
                               ),
                             ],
+                          ),
                           ),
                         );
                       }),
                     ],
                   ),
                 ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _save,
-                  icon: const Icon(Icons.check_rounded),
-                  label: const Text('Save changes'),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _appPrimary,
-                    foregroundColor: const Color(0xFF131313),
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                  ),
-                ),
               ],
+            ),
+          ),
+        ),
+      ),
+      bottomNavigationBar: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: <Color>[
+              Color(0x00151126),
+              Color(0xFF151126),
+              _appBackground,
+            ],
+          ),
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: FilledButton.icon(
+              onPressed: _save,
+              icon: const Icon(Icons.check_rounded),
+              label: const Text('Save changes'),
+              style: FilledButton.styleFrom(
+                backgroundColor: _appPrimary,
+                foregroundColor: const Color(0xFF131313),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
             ),
           ),
         ),
@@ -3482,6 +3613,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   _ImportState _importState = _ImportState.idle;
   _ImporterStep _importerStep = _ImporterStep.choose;
   String _statusMessage = '';
+  String? _playlistImportArtworkUrl;
   String? get _spotifySessionId {
     final String trimmed = (widget.spotifySessionId ?? '').trim();
     if (trimmed.isEmpty) {
@@ -3749,6 +3881,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   Future<List<_SpotifyImportTrack>?> _showTrackSelectionSheet({
     required String title,
     required List<_SpotifyImportTrack> tracks,
+    String? artworkUrl,
   }) async {
     return showModalBottomSheet<List<_SpotifyImportTrack>>(
       context: context,
@@ -3768,19 +3901,54 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w800,
-                          color: Colors.white,
+                      if ((artworkUrl ?? '').trim().isNotEmpty)
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            _ImportArtworkThumbnail(
+                              artworkUrl: artworkUrl,
+                              size: 56,
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    title,
+                                    style: const TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w800,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    '${tracks.length} songs available • $selectedCount selected',
+                                    style: const TextStyle(
+                                      color: _appMutedText,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        )
+                      else ...<Widget>[
+                        Text(
+                          title,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '${tracks.length} songs available • $selectedCount selected',
-                        style: const TextStyle(color: _appMutedText),
-                      ),
+                        const SizedBox(height: 6),
+                        Text(
+                          '${tracks.length} songs available • $selectedCount selected',
+                          style: const TextStyle(color: _appMutedText),
+                        ),
+                      ],
                       const SizedBox(height: 10),
                       Row(
                         children: <Widget>[
@@ -3895,12 +4063,17 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     required String selectionTitle,
     required String sourceLabel,
     required List<_SpotifyImportTrack> tracks,
+    String? artworkUrl,
   }) async {
     if (!mounted) {
       return;
     }
     final List<_SpotifyImportTrack>? selectedTracks =
-        await _showTrackSelectionSheet(title: selectionTitle, tracks: tracks);
+        await _showTrackSelectionSheet(
+          title: selectionTitle,
+          tracks: tracks,
+          artworkUrl: artworkUrl,
+        );
     if (!mounted) {
       return;
     }
@@ -3908,6 +4081,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       setState(() {
         _importState = _ImportState.idle;
         _statusMessage = '';
+        _playlistImportArtworkUrl = null;
       });
       return;
     }
@@ -3919,6 +4093,9 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       return;
     }
     _applyImportedTracks(selectedTracks, sourceLabel);
+    setState(() {
+      _playlistImportArtworkUrl = null;
+    });
   }
 
   Future<void> _importLikedSongs() async {
@@ -4008,6 +4185,9 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                   itemBuilder: (BuildContext context, int index) {
                     final _SpotifyPlaylistSummary playlist = playlists[index];
                     return ListTile(
+                      leading: _ImportArtworkThumbnail(
+                        artworkUrl: playlist.artworkUrl,
+                      ),
                       title: Text(playlist.name),
                       subtitle: Text('${playlist.tracksTotal} songs'),
                       onTap: () {
@@ -4023,12 +4203,14 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         setState(() {
           _importState = _ImportState.idle;
           _statusMessage = '';
+          _playlistImportArtworkUrl = null;
         });
         return;
       }
       setState(() {
         _importState = _ImportState.loading;
         _statusMessage = 'Loading songs from ${selectedPlaylist.name}...';
+        _playlistImportArtworkUrl = selectedPlaylist.artworkUrl;
       });
       final List<_SpotifyImportTrack> tracks = await _importPlaylistTracksById(
         selectedPlaylist.id,
@@ -4037,6 +4219,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         selectionTitle: 'Select songs from ${selectedPlaylist.name}',
         sourceLabel: selectedPlaylist.name,
         tracks: tracks,
+        artworkUrl: selectedPlaylist.artworkUrl,
       );
     } catch (error) {
       if (!mounted) {
@@ -4048,11 +4231,13 @@ class _SongImporterPageState extends State<_SongImporterPage> {
           error,
           fallback: 'Could not import from your playlists.',
         );
+        _playlistImportArtworkUrl = null;
       });
     }
   }
 
-  Future<List<_SpotifyImportTrack>> _importFromBackend(Uri spotifyUri) async {
+  Future<({List<_SpotifyImportTrack> tracks, String? playlistArtworkUrl})>
+  _importFromBackend(Uri spotifyUri) async {
     final Uri endpoint = Uri.parse(
       '$_spotifyBackendBaseUrl/spotify/import-url',
     ).replace(queryParameters: <String, String>{'url': spotifyUri.toString()});
@@ -4092,7 +4277,11 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     if (tracks.isEmpty) {
       throw const FormatException('No tracks found');
     }
-    return tracks;
+    final Map<String, dynamic>? playlistMap = _asStringKeyedMap(payload['playlist']);
+    final String? playlistArtworkUrl = playlistMap == null
+        ? null
+        : _SpotifyPlaylistSummary.fromJson(playlistMap).artworkUrl;
+    return (tracks: tracks, playlistArtworkUrl: playlistArtworkUrl);
   }
 
   Song _songFromImportedTrack(
@@ -4138,11 +4327,20 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       setState(() {
         _importState = _ImportState.loading;
         _statusMessage = 'Importing playlist from Spotify...';
+        _playlistImportArtworkUrl = null;
       });
       try {
-        final List<_SpotifyImportTrack> importedTracks =
-            await _importFromBackend(spotifyUri);
-        final List<Song> songs = importedTracks
+        final ({
+          List<_SpotifyImportTrack> tracks,
+          String? playlistArtworkUrl,
+        }) importResult = await _importFromBackend(spotifyUri);
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _playlistImportArtworkUrl = importResult.playlistArtworkUrl;
+        });
+        final List<Song> songs = importResult.tracks
             .map(
               (_SpotifyImportTrack track) => _songFromImportedTrack(
                 track,
@@ -4167,6 +4365,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
           _importState = _ImportState.error;
           _statusMessage =
               'Playlist import needs the backend running at $_spotifyBackendBaseUrl.';
+          _playlistImportArtworkUrl = null;
         });
       }
       return;
@@ -4343,11 +4542,30 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     if (_statusMessage.isEmpty) {
       return const SizedBox.shrink();
     }
+    final String? artworkUrl = _playlistImportArtworkUrl;
+    if ((artworkUrl ?? '').trim().isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Text(
+          _statusMessage,
+          style: TextStyle(color: statusColor, fontSize: 12),
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.only(top: 8),
-      child: Text(
-        _statusMessage,
-        style: TextStyle(color: statusColor, fontSize: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          _ImportArtworkThumbnail(artworkUrl: artworkUrl, size: 44),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              _statusMessage,
+              style: TextStyle(color: statusColor, fontSize: 12),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -4960,8 +5178,8 @@ class _CurrentSongBarFramePainter extends CustomPainter {
         clockwise: true,
       )
       ..lineTo(width - inset, height - inset)
-      ..lineTo(tabRight - strokeWidth, height - inset)
-      ..moveTo(tabLeft + strokeWidth, height - inset)
+      ..lineTo(tabRight - inset, height - inset)
+      ..moveTo(tabLeft + inset, height - inset)
       ..lineTo(inset + radius, height - inset)
       ..arcToPoint(
         Offset(inset, height - inset - radius),
@@ -5038,15 +5256,8 @@ class _CurrentSongBar extends StatelessWidget {
       child: LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           final double barWidth = constraints.maxWidth;
-          final double tabContentWidth =
-              barWidth - _bottomNavHorizontalPadding;
-          final double tabWidth = tabContentWidth / _bottomNavTabCount;
-          // Outer edges of the "Current Song" tab (rightmost tab) in the
-          // action bar below; the tab's right edge is flush with the bar.
-          final double tabLeft =
-              _bottomNavHorizontalPadding +
-              (tabWidth * (_bottomNavTabCount - 1));
-          final double tabRight = barWidth;
+          final double tabLeft = _currentSongTabLeft(barWidth);
+          final double tabRight = _currentSongTabRight(barWidth);
           const double barCornerRadius = 18;
 
           return Stack(
@@ -5213,9 +5424,9 @@ class _BottomActionBar extends StatelessWidget {
       margin: margin,
       padding: EdgeInsets.fromLTRB(
         _bottomNavHorizontalPadding,
-        hasConnectedCurrentSongSection ? 0 : 6,
+        hasConnectedCurrentSongSection ? 0 : 8,
         hasConnectedCurrentSongSection ? 0 : _bottomNavHorizontalPadding,
-        6,
+        8,
       ),
       decoration: BoxDecoration(
         color: _appSurfaceStrong.withValues(alpha: 0.96),
@@ -5232,31 +5443,49 @@ class _BottomActionBar extends StatelessWidget {
       child: Row(
         children: <Widget>[
           Expanded(
-            child: _BottomActionButton(
-              label: 'Importer',
-              icon: Icons.playlist_add_rounded,
-              selected: activeIndex == 0,
-              topInset: hasConnectedCurrentSongSection ? 6 : 0,
-              onPressed: () => onActionPressed(0),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: _bottomNavTabHorizontalInset,
+              ),
+              child: _BottomActionButton(
+                label: 'Importer',
+                icon: Icons.playlist_add_rounded,
+                selected: activeIndex == 0,
+                topInset: hasConnectedCurrentSongSection ? 8 : 0,
+                onPressed: () => onActionPressed(0),
+              ),
             ),
           ),
           Expanded(
-            child: _BottomActionButton(
-              label: 'Setlist',
-              icon: Icons.queue_music_rounded,
-              selected: activeIndex == 1,
-              topInset: hasConnectedCurrentSongSection ? 6 : 0,
-              onPressed: () => onActionPressed(1),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: _bottomNavTabHorizontalInset,
+              ),
+              child: _BottomActionButton(
+                label: 'Setlist',
+                icon: Icons.queue_music_rounded,
+                selected: activeIndex == 1,
+                topInset: hasConnectedCurrentSongSection ? 8 : 0,
+                onPressed: () => onActionPressed(1),
+              ),
             ),
           ),
           Expanded(
-            child: _BottomActionButton(
-              label: 'Current Song',
-              icon: Icons.equalizer_rounded,
-              selected: activeIndex == 2,
-              highlighted: highlightCurrentSongAction,
-              connectedToBar: hasConnectedCurrentSongSection,
-              onPressed: () => onActionPressed(2),
+            child: Padding(
+              padding: EdgeInsets.only(
+                left: _bottomNavTabHorizontalInset,
+                right: hasConnectedCurrentSongSection
+                    ? 0
+                    : _bottomNavTabHorizontalInset,
+              ),
+              child: _BottomActionButton(
+                label: 'Current Song',
+                icon: Icons.equalizer_rounded,
+                selected: activeIndex == 2,
+                highlighted: highlightCurrentSongAction,
+                connectedToBar: hasConnectedCurrentSongSection,
+                onPressed: () => onActionPressed(2),
+              ),
             ),
           ),
         ],
@@ -5291,10 +5520,10 @@ class _BottomActionButton extends StatelessWidget {
     final bool useConnectedBorder = connectedToBar && (highlighted || selected);
     final BorderRadius borderRadius = connectedToBar
         ? const BorderRadius.only(
-            bottomLeft: Radius.circular(12),
+            bottomLeft: Radius.circular(14),
             bottomRight: Radius.circular(_bottomNavOuterCornerRadius),
           )
-        : BorderRadius.circular(12);
+        : BorderRadius.circular(14);
     final BoxBorder? border = useConnectedBorder
         ? const Border(
             left: BorderSide(color: _appPrimary, width: _connectedOutlineWidth),
@@ -5319,8 +5548,8 @@ class _BottomActionButton extends StatelessWidget {
     // current-song bar flush; the siblings' inset moves inside the tab
     // instead, keeping icon and label aligned across all tabs.
     final EdgeInsets contentPadding = connectedToBar
-        ? const EdgeInsets.only(top: 14, bottom: 7)
-        : const EdgeInsets.symmetric(vertical: 7);
+        ? const EdgeInsets.only(top: 18, bottom: 10)
+        : const EdgeInsets.symmetric(vertical: 10);
 
     return Padding(
       padding: EdgeInsets.only(top: topInset),
@@ -5339,13 +5568,13 @@ class _BottomActionButton extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: <Widget>[
-                Icon(icon, size: 18, color: foregroundColor),
-                const SizedBox(height: 3),
+                Icon(icon, size: 20, color: foregroundColor),
+                const SizedBox(height: 4),
                 Text(
                   label,
                   style: TextStyle(
                     color: foregroundColor,
-                    fontSize: 10,
+                    fontSize: 11,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -5447,7 +5676,7 @@ class _RoleInstrumentLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         color: _appSurface.withValues(alpha: 0.55),
         borderRadius: BorderRadius.circular(12),
@@ -5466,6 +5695,26 @@ class _RoleInstrumentLabel extends StatelessWidget {
       ),
     );
   }
+}
+
+InputDecoration _rolePillInputDecoration({String? hintText}) {
+  final OutlineInputBorder border = OutlineInputBorder(
+    borderRadius: BorderRadius.circular(12),
+    borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+  );
+  return InputDecoration(
+    hintText: hintText,
+    filled: true,
+    fillColor: _appSurface.withValues(alpha: 0.55),
+    isDense: true,
+    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
+    border: border,
+    enabledBorder: border,
+    focusedBorder: OutlineInputBorder(
+      borderRadius: BorderRadius.circular(12),
+      borderSide: BorderSide(color: _appPrimary.withValues(alpha: 0.75)),
+    ),
+  );
 }
 
 class _SectionLabel extends StatelessWidget {
