@@ -163,8 +163,114 @@ function normalizePlaylist(playlist) {
   return {
     id: playlist?.id || '',
     name: (playlist?.name || '').trim(),
-    tracksTotal: Number(playlist?.tracks?.total || 0),
+    tracksTotal: Number(
+      playlist?.items?.total ?? playlist?.tracks?.total ?? 0,
+    ),
   };
+}
+
+function trackFromPlaylistItem(entry) {
+  return entry?.item ?? entry?.track ?? null;
+}
+
+async function fetchUserPlaylistsPage(sessionId, offset, limit) {
+  const paths = [
+    `/me/playlists?limit=${limit}&offset=${offset}`,
+    `/me/playlists?limit=${limit}&offset=${offset}&fields=items(id,name,items(total),tracks(total)),next`,
+  ];
+
+  let lastError;
+  for (const path of paths) {
+    try {
+      return await userSpotifyGetJson(sessionId, path);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error('Failed to fetch playlists');
+}
+
+async function fetchPlaylistTracksPage(
+  playlistId,
+  accessToken,
+  sessionId,
+  resource,
+  offset,
+  limit,
+) {
+  const path =
+    `/playlists/${encodeURIComponent(playlistId)}/${resource}` +
+    `?limit=${limit}&offset=${offset}`;
+  return sessionId
+    ? await userSpotifyGetJson(sessionId, path)
+    : await spotifyGetJson(path, accessToken);
+}
+
+async function importPlaylistByIdWithToken(playlistId, accessToken, sessionId) {
+  const resources = sessionId ? ['items', 'tracks'] : ['items', 'tracks'];
+  let lastError;
+
+  for (const resource of resources) {
+    try {
+      const tracks = await collectPlaylistTracks(
+        playlistId,
+        accessToken,
+        sessionId,
+        resource,
+      );
+      if (tracks.length > 0 || resource === resources[resources.length - 1]) {
+        return tracks;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error(`No tracks found for playlist ${playlistId}`);
+}
+
+async function collectPlaylistTracks(
+  playlistId,
+  accessToken,
+  sessionId,
+  resource,
+) {
+  const tracks = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const payload = await fetchPlaylistTracksPage(
+      playlistId,
+      accessToken,
+      sessionId,
+      resource,
+      offset,
+      limit,
+    );
+
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    for (const item of items) {
+      const track = trackFromPlaylistItem(item);
+      if (!track?.id) {
+        continue;
+      }
+      tracks.push(normalizeTrack(track));
+    }
+    if (!payload?.next || items.length === 0) {
+      break;
+    }
+    offset += limit;
+  }
+
+  return tracks;
 }
 
 function firstSpotifyImageUrl(images) {
@@ -324,52 +430,13 @@ async function importPlaylistByIdForSession(sessionId, playlistId) {
   return importPlaylistByIdWithToken(playlistId, accessToken, sessionId);
 }
 
-async function importPlaylistByIdWithToken(playlistId, accessToken, sessionId) {
-  const tracks = [];
-  let offset = 0;
-  const limit = 100;
-
-  while (true) {
-    const payload = sessionId
-      ? await userSpotifyGetJson(
-          sessionId,
-          `/playlists/${encodeURIComponent(
-            playlistId,
-          )}/tracks?limit=${limit}&offset=${offset}&fields=items(track(id,name,uri,duration_ms,external_urls,album(images),artists(name))),next`,
-        )
-      : await spotifyGetJson(
-          `/playlists/${encodeURIComponent(
-            playlistId,
-          )}/tracks?limit=${limit}&offset=${offset}&fields=items(track(id,name,uri,duration_ms,external_urls,album(images),artists(name))),next`,
-          accessToken,
-        );
-
-    const items = Array.isArray(payload?.items) ? payload.items : [];
-    for (const item of items) {
-      const track = item?.track;
-      if (!track?.id) {
-        continue;
-      }
-      tracks.push(normalizeTrack(track));
-    }
-    if (!payload?.next) {
-      break;
-    }
-    offset += limit;
-  }
-  return tracks;
-}
-
 async function listUserPlaylists(sessionId) {
   const playlists = [];
   let offset = 0;
   const limit = 50;
 
   while (true) {
-    const payload = await userSpotifyGetJson(
-      sessionId,
-      `/me/playlists?limit=${limit}&offset=${offset}&fields=items(id,name,tracks(total)),next`,
-    );
+    const payload = await fetchUserPlaylistsPage(sessionId, offset, limit);
     const items = Array.isArray(payload?.items) ? payload.items : [];
     for (const playlist of items) {
       if (!playlist?.id) {
@@ -377,7 +444,7 @@ async function listUserPlaylists(sessionId) {
       }
       playlists.push(normalizePlaylist(playlist));
     }
-    if (!payload?.next) {
+    if (!payload?.next || items.length === 0) {
       break;
     }
     offset += limit;
@@ -643,7 +710,9 @@ spotifyApi.get('/spotify/me/playlists', async (req, res) => {
 spotifyApi.get('/spotify/me/playlist-tracks', async (req, res) => {
   try {
     const sessionId = String(req.query.sessionId || '').trim();
-    const playlistId = String(req.query.playlistId || '').trim();
+    const playlistId = String(
+      req.query.playlistId || req.query.playlist_id || req.query.id || '',
+    ).trim();
     if (!playlistId) {
       return res.status(400).json({ error: 'Missing playlistId query parameter' });
     }

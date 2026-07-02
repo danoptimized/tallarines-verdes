@@ -22,10 +22,31 @@ const Color _appPrimary = Color(0xFFE0F64F);
 const Color _appMutedText = Color(0xFFB8B5CB);
 const Color _appAccent = Color(0xFF5D4A8A);
 
+// Shared geometry between _CurrentSongBar and _BottomActionBar so the
+// current-song outline lines up exactly with the "Current Song" tab.
+const double _bottomNavHorizontalPadding = 8;
+const double _bottomNavOuterCornerRadius = 20;
+const double _connectedOutlineWidth = 1.5;
+const int _bottomNavTabCount = 3;
+const List<String> _editableInstrumentOptions = <String>[
+  'Guitar',
+  'Drums',
+  'Vocals',
+  'Bass',
+  'Keys',
+];
+const List<String> _editablePlayerOptions = <String>[
+  'Daniel',
+  'Jim',
+  'Matt',
+  'Brenda',
+  'Ben',
+  'Mikayla',
+];
+
 enum SongSourceType { manual, spotifyUrl, spotifyAccount }
 
 enum _SpotifyUrlKind { invalid, track, playlist }
-
 
 final Random _random = Random();
 
@@ -37,6 +58,27 @@ String _cleanSpotifyTitle(String value) {
   return value
       .replaceFirst(RegExp(r'\s*\|\s*Spotify\s*$', caseSensitive: false), '')
       .trim();
+}
+
+String _asTrimmedString(Object? value) {
+  if (value == null) {
+    return '';
+  }
+  if (value is String) {
+    return value.trim();
+  }
+  return value.toString().trim();
+}
+
+int? _asInt(Object? value) {
+  if (value is num) {
+    return value.toInt();
+  }
+  final String parsed = _asTrimmedString(value);
+  if (parsed.isEmpty) {
+    return null;
+  }
+  return int.tryParse(parsed);
 }
 
 Map<String, dynamic>? _asStringKeyedMap(Object? value) {
@@ -112,8 +154,132 @@ String? _spotifyTrackIdFromUrl(String spotifyUrl) {
   return _spotifyEntityIdFromUri(uri, 'track');
 }
 
+String _sanitizeSpotifyTrackId(String value) {
+  return value.trim().split('?').first.split('#').first.trim();
+}
+
+String? _spotifyTrackIdFromSpotifyUri(String? spotifyUri) {
+  final List<String> parts = (spotifyUri ?? '').trim().split(':');
+  if (parts.length < 3) {
+    return null;
+  }
+  final String type = parts[1].trim().toLowerCase();
+  if (type != 'track') {
+    return null;
+  }
+  final String trackId = _sanitizeSpotifyTrackId(parts[2]);
+  if (trackId.isEmpty) {
+    return null;
+  }
+  return trackId;
+}
+
+String _spotifyPlayUriFromTrackId(String trackId) {
+  return 'spotify:track:${_sanitizeSpotifyTrackId(trackId)}';
+}
+
+String _durationFromMilliseconds(int milliseconds) {
+  if (milliseconds <= 0) {
+    return '';
+  }
+  final int totalSeconds = milliseconds ~/ 1000;
+  final int minutes = totalSeconds ~/ 60;
+  final int seconds = totalSeconds % 60;
+  return '$minutes:${seconds.toString().padLeft(2, '0')}';
+}
+
+String? _spotifyPlaylistIdFromSpotifyUri(String? spotifyUri) {
+  final List<String> parts = (spotifyUri ?? '').trim().split(':');
+  if (parts.length < 3) {
+    return null;
+  }
+  final String type = parts[1].trim().toLowerCase();
+  if (type != 'playlist') {
+    return null;
+  }
+  final String playlistId = parts[2].split('?').first.split('#').first.trim();
+  if (playlistId.isEmpty) {
+    return null;
+  }
+  return playlistId;
+}
+
+Uri? _parseExternalHttpUri(String rawUrl) {
+  final Uri? parsed = Uri.tryParse(rawUrl.trim());
+  if (parsed == null) {
+    return null;
+  }
+  if (parsed.scheme != 'http' && parsed.scheme != 'https') {
+    return null;
+  }
+  return parsed;
+}
+
+bool _songHasPlayableSpotifyTrack(Song song) {
+  if ((song.spotifyTrackId ?? '').trim().isNotEmpty) {
+    return true;
+  }
+  if (_spotifyTrackIdFromSpotifyUri(song.spotifyUri) != null) {
+    return true;
+  }
+  return _spotifyTrackIdFromUrl(song.spotifyUrl) != null;
+}
+
+Future<void> _openExternalLink(
+  BuildContext context,
+  String rawUrl, {
+  String failureMessage = 'Could not open link.',
+}) async {
+  final Uri? uri = _parseExternalHttpUri(rawUrl);
+  if (uri == null) {
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Invalid link URL.')));
+    return;
+  }
+  bool opened = false;
+  try {
+    opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+  } catch (_) {}
+  if (!opened && context.mounted) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(failureMessage)));
+  }
+}
+
 String _normalizeForMatch(String value) {
   return value.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+String _spotifyBackendFailureMessage(
+  Object? error, {
+  http.Response? response,
+  required String fallback,
+}) {
+  if (response != null) {
+    try {
+      final Object? decoded = jsonDecode(response.body);
+      final Map<String, dynamic>? payload = _asStringKeyedMap(decoded);
+      final String serverError = _asTrimmedString(payload?['error']);
+      if (serverError.isNotEmpty) {
+        return serverError;
+      }
+    } catch (_) {}
+    if (response.statusCode == 401) {
+      return 'Spotify account not connected. Reconnect Spotify and try again.';
+    }
+  }
+  if (error is FormatException) {
+    final String message = error.message.trim();
+    if (message.isNotEmpty) {
+      return message;
+    }
+  }
+  return fallback;
 }
 
 const String _spotifyBackendBaseUrl = String.fromEnvironment(
@@ -129,7 +295,8 @@ const String _spotifySdkRedirectUri = String.fromEnvironment(
   defaultValue: '',
 );
 const String _spotifyAndroidAppRemoteRedirectUri = 'spotify-sdk://auth';
-const String _spotifyIosAppRemoteRedirectUri = 'tallarinesverdes://spotify-auth';
+const String _spotifyIosAppRemoteRedirectUri =
+    'tallarinesverdes://spotify-auth';
 const String _spotifyRemoteAuthScope =
     'app-remote-control,user-modify-playback-state,user-read-playback-state,user-read-currently-playing,streaming';
 
@@ -167,14 +334,208 @@ class _SpotifyImportTrack {
   final String? artworkUrl;
 
   factory _SpotifyImportTrack.fromJson(Map<String, dynamic> json) {
+    final Map<String, dynamic> trackPayload =
+        _asStringKeyedMap(json['track']) ??
+        _asStringKeyedMap(json['item']) ??
+        json;
+    final Map<String, dynamic>? externalUrls = _asStringKeyedMap(
+      trackPayload['external_urls'],
+    );
+    final Map<String, dynamic>? albumPayload = _asStringKeyedMap(
+      trackPayload['album'],
+    );
+
+    final String title = _asTrimmedString(trackPayload['title']).isNotEmpty
+        ? _asTrimmedString(trackPayload['title'])
+        : _asTrimmedString(trackPayload['name']);
+
+    String artist = _asTrimmedString(trackPayload['artist']);
+    if (artist.isEmpty) {
+      artist = _asTrimmedString(trackPayload['artistsText']);
+    }
+    if (artist.isEmpty) {
+      final Object? rawArtists = trackPayload['artists'];
+      if (rawArtists is List) {
+        final List<String> artistNames = rawArtists
+            .map((Object? rawArtist) {
+              final Map<String, dynamic>? artistMap = _asStringKeyedMap(
+                rawArtist,
+              );
+              return _asTrimmedString(artistMap?['name']);
+            })
+            .where((String value) => value.isNotEmpty)
+            .toList(growable: false);
+        artist = artistNames.join(', ');
+      }
+    }
+
+    String spotifyUrl = _asTrimmedString(trackPayload['spotifyUrl']);
+    if (spotifyUrl.isEmpty) {
+      spotifyUrl = _asTrimmedString(trackPayload['url']);
+    }
+    if (spotifyUrl.isEmpty) {
+      spotifyUrl = _asTrimmedString(externalUrls?['spotify']);
+    }
+
+    String spotifyUri = _asTrimmedString(trackPayload['spotifyUri']);
+    if (spotifyUri.isEmpty) {
+      spotifyUri = _asTrimmedString(trackPayload['uri']);
+    }
+
+    String spotifyTrackId = _sanitizeSpotifyTrackId(
+      _asTrimmedString(trackPayload['spotifyTrackId']).isNotEmpty
+          ? _asTrimmedString(trackPayload['spotifyTrackId'])
+          : _asTrimmedString(trackPayload['trackId']).isNotEmpty
+          ? _asTrimmedString(trackPayload['trackId'])
+          : _asTrimmedString(trackPayload['id']),
+    );
+    if (spotifyTrackId.isEmpty) {
+      spotifyTrackId =
+          _spotifyTrackIdFromSpotifyUri(spotifyUri) ??
+          (_spotifyTrackIdFromUrl(spotifyUrl) ?? '');
+    }
+    spotifyTrackId = _sanitizeSpotifyTrackId(spotifyTrackId);
+    if (spotifyTrackId.isNotEmpty && spotifyUri.isEmpty) {
+      spotifyUri = _spotifyPlayUriFromTrackId(spotifyTrackId);
+    }
+    if (spotifyTrackId.isNotEmpty && spotifyUrl.isEmpty) {
+      spotifyUrl = 'https://open.spotify.com/track/$spotifyTrackId';
+    }
+
+    String duration = _asTrimmedString(trackPayload['duration']);
+    if (duration.isEmpty) {
+      final int durationMs =
+          _asInt(trackPayload['durationMs']) ??
+          _asInt(trackPayload['duration_ms']) ??
+          0;
+      duration = _durationFromMilliseconds(durationMs);
+    }
+
+    String artworkUrl = _asTrimmedString(trackPayload['artworkUrl']);
+    if (artworkUrl.isEmpty) {
+      artworkUrl = _firstSpotifyImageUrl(trackPayload['images']) ?? '';
+    }
+    if (artworkUrl.isEmpty) {
+      artworkUrl = _asTrimmedString(albumPayload?['artworkUrl']);
+    }
+    if (artworkUrl.isEmpty) {
+      artworkUrl = _firstSpotifyImageUrl(albumPayload?['images']) ?? '';
+    }
+    final String? normalizedArtworkUrl = artworkUrl.isEmpty ? null : artworkUrl;
     return _SpotifyImportTrack(
-      title: (json['title'] as String? ?? '').trim(),
-      artist: (json['artist'] as String? ?? '').trim(),
-      duration: (json['duration'] as String? ?? '').trim(),
-      spotifyUrl: (json['spotifyUrl'] as String? ?? '').trim(),
-      spotifyTrackId: (json['spotifyTrackId'] as String? ?? '').trim(),
-      spotifyUri: (json['spotifyUri'] as String? ?? '').trim(),
-      artworkUrl: (json['artworkUrl'] as String?)?.trim(),
+      title: title,
+      artist: artist,
+      duration: duration,
+      spotifyUrl: spotifyUrl,
+      spotifyTrackId: spotifyTrackId,
+      spotifyUri: spotifyUri,
+      artworkUrl: normalizedArtworkUrl,
+    );
+  }
+}
+
+class _SongArtworkThumbnail extends StatelessWidget {
+  const _SongArtworkThumbnail({
+    required this.artworkUrl,
+    required this.isCurrent,
+  });
+
+  final String? artworkUrl;
+  final bool isCurrent;
+
+  @override
+  Widget build(BuildContext context) {
+    final String resolvedArtworkUrl = (artworkUrl ?? '').trim();
+    final Widget fallback = Container(
+      color: _appSurface,
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.music_note_rounded,
+        size: 20,
+        color: Colors.white.withValues(alpha: 0.7),
+      ),
+    );
+
+    return Container(
+      width: 54,
+      height: 54,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isCurrent
+              ? _appPrimary.withValues(alpha: 0.7)
+              : Colors.white.withValues(alpha: 0.08),
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(7),
+        child: resolvedArtworkUrl.isEmpty
+            ? fallback
+            : Image.network(
+                resolvedArtworkUrl,
+                fit: BoxFit.cover,
+                errorBuilder:
+                    (
+                      BuildContext context,
+                      Object error,
+                      StackTrace? stackTrace,
+                    ) {
+                      return fallback;
+                    },
+              ),
+      ),
+    );
+  }
+}
+
+class _SetlistActionBarButton extends StatelessWidget {
+  const _SetlistActionBarButton({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    this.highlighted = false,
+    this.danger = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onPressed;
+  final bool highlighted;
+  final bool danger;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isEnabled = onPressed != null;
+    final Color activeColor = danger
+        ? const Color(0xFFFF9A9A)
+        : highlighted
+        ? _appPrimary
+        : _appMutedText;
+    final Color foregroundColor = isEnabled
+        ? activeColor
+        : _appMutedText.withValues(alpha: 0.5);
+    return Expanded(
+      child: TextButton(
+        onPressed: onPressed,
+        style: TextButton.styleFrom(
+          foregroundColor: foregroundColor,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(icon, size: 19),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -219,10 +580,49 @@ class _SpotifyPlaylistSummary {
   final int tracksTotal;
 
   factory _SpotifyPlaylistSummary.fromJson(Map<String, dynamic> json) {
+    String id = _asTrimmedString(json['id']);
+    if (id.isEmpty) {
+      id = _asTrimmedString(json['playlistId']);
+    }
+    if (id.isEmpty) {
+      id =
+          _spotifyPlaylistIdFromSpotifyUri(_asTrimmedString(json['uri'])) ?? '';
+    }
+    if (id.isEmpty) {
+      final Map<String, dynamic>? externalUrls = _asStringKeyedMap(
+        json['external_urls'],
+      );
+      final Uri? playlistUri = Uri.tryParse(
+        _asTrimmedString(externalUrls?['spotify']),
+      );
+      id = playlistUri == null
+          ? ''
+          : (_spotifyEntityIdFromUri(playlistUri, 'playlist') ?? '');
+    }
+
+    String name = _asTrimmedString(json['name']);
+    if (name.isEmpty) {
+      name = _asTrimmedString(json['title']);
+    }
+
+    final Map<String, dynamic>? tracksMap = _asStringKeyedMap(json['tracks']);
+    final Map<String, dynamic>? itemsMap = _asStringKeyedMap(json['items']);
+    final Object? rawTrackItems = tracksMap?['items'] ?? itemsMap?['items'];
+    final int nestedItemsCount = rawTrackItems is List
+        ? rawTrackItems.length
+        : 0;
+    final int tracksTotal =
+        _asInt(json['tracksTotal']) ??
+        _asInt(json['tracks_count']) ??
+        _asInt(json['trackCount']) ??
+        _asInt(json['totalTracks']) ??
+        _asInt(itemsMap?['total']) ??
+        _asInt(tracksMap?['total']) ??
+        nestedItemsCount;
     return _SpotifyPlaylistSummary(
-      id: (json['id'] as String? ?? '').trim(),
-      name: (json['name'] as String? ?? '').trim(),
-      tracksTotal: (json['tracksTotal'] as num?)?.toInt() ?? 0,
+      id: id,
+      name: name,
+      tracksTotal: tracksTotal,
     );
   }
 }
@@ -269,9 +669,7 @@ String? _spotifyImageUriToUrl(String? imageUriRaw) {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const TallarinesVerdesApp());
 }
 
@@ -321,17 +719,25 @@ class RoleAssignment {
     required this.id,
     required this.instrument,
     required this.player,
+    required this.chartUrl,
   });
 
   final String id;
   final String instrument;
   final String player;
+  final String chartUrl;
 
   factory RoleAssignment.fromJson(Map<String, dynamic> json) {
     return RoleAssignment(
       id: json['id'] as String? ?? _createId('role'),
       instrument: json['instrument'] as String? ?? '',
       player: json['player'] as String? ?? '',
+      chartUrl:
+          (json['chartUrl'] as String? ??
+                  json['chordsTabUrl'] as String? ??
+                  json['link'] as String? ??
+                  '')
+              .trim(),
     );
   }
 
@@ -340,6 +746,7 @@ class RoleAssignment {
       'id': id,
       'instrument': instrument,
       'player': player,
+      'chartUrl': chartUrl,
     };
   }
 }
@@ -353,6 +760,7 @@ class Song {
     required this.key,
     required this.bpm,
     required this.spotifyUrl,
+    required this.modifier,
     required this.notes,
     required this.artworkUrl,
     required this.roles,
@@ -369,6 +777,7 @@ class Song {
   final String key;
   final String bpm;
   final String spotifyUrl;
+  final String modifier;
   final String notes;
   final String? artworkUrl;
   final List<RoleAssignment> roles;
@@ -398,6 +807,7 @@ class Song {
       key: json['key'] as String? ?? '',
       bpm: json['bpm'] as String? ?? '',
       spotifyUrl: json['spotifyUrl'] as String? ?? '',
+      modifier: json['modifier'] as String? ?? '',
       notes: json['notes'] as String? ?? '',
       artworkUrl: json['artworkUrl'] as String?,
       roles: parsedRoles,
@@ -423,6 +833,7 @@ class Song {
       'key': key,
       'bpm': bpm,
       'spotifyUrl': spotifyUrl,
+      'modifier': modifier,
       'notes': notes,
       'artworkUrl': artworkUrl,
       'roles': roles.map((RoleAssignment role) => role.toJson()).toList(),
@@ -440,12 +851,15 @@ class SetlistHomePage extends StatefulWidget {
   @override
   State<SetlistHomePage> createState() => _SetlistHomePageState();
 }
+
 class _ImportMergeResult {
-  const _ImportMergeResult({required this.addedCount, required this.updatedCount});
+  const _ImportMergeResult({
+    required this.addedCount,
+    required this.updatedCount,
+  });
 
   final int addedCount;
   final int updatedCount;
-
   int get totalProcessed => addedCount + updatedCount;
 }
 
@@ -455,7 +869,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
 
   List<Song> _songs = <Song>[];
   String? _currentSongId;
-  int _tabIndex = 0;
+  int _tabIndex = 1;
   bool _isLoading = true;
   String? _firebaseUserId;
   bool _spotifyAccountConnected = false;
@@ -468,8 +882,11 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   String? _spotifyPlayerErrorMessage;
   StreamSubscription<PlayerState>? _spotifyPlayerStateSubscription;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
-      _setlistSubscription;
+  _sharedSetlistSubscription;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _songsSubscription;
+  String? _sharedCurrentSongSpotifyTrackId;
+  String? _sharedCurrentSongTitle;
+  String? _sharedCurrentSongArtist;
 
   String? get _spotifySessionId {
     final String trimmed = (_firebaseUserId ?? '').trim();
@@ -491,9 +908,9 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     String path, {
     Map<String, String> queryParameters = const <String, String>{},
   }) {
-    return Uri.parse('$_spotifyBackendBaseUrl$path').replace(
-      queryParameters: queryParameters,
-    );
+    return Uri.parse(
+      '$_spotifyBackendBaseUrl$path',
+    ).replace(queryParameters: queryParameters);
   }
 
   DocumentReference<Map<String, dynamic>>? get _setlistDoc {
@@ -508,6 +925,10 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         .doc('main');
   }
 
+  DocumentReference<Map<String, dynamic>> get _sharedSetlistDoc {
+    return _firestore.collection('setlists').doc('live');
+  }
+
   CollectionReference<Map<String, dynamic>>? get _songsCollection {
     final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
     if (setlistDoc == null) {
@@ -517,14 +938,57 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   }
 
   String? get _resolvedCurrentSongId {
-    if (_songs.isEmpty) {
-      return null;
-    }
     if (_currentSongId != null &&
         _songs.any((Song song) => song.id == _currentSongId)) {
       return _currentSongId;
     }
-    return _songs.first.id;
+    return null;
+  }
+
+  Song? _songById(String songId) {
+    for (final Song song in _songs) {
+      if (song.id == songId) {
+        return song;
+      }
+    }
+    return null;
+  }
+
+  String? _resolveCurrentSongIdFromSharedRef() {
+    final String sharedTrackId = (_sharedCurrentSongSpotifyTrackId ?? '').trim();
+    if (sharedTrackId.isNotEmpty) {
+      for (final Song song in _songs) {
+        if ((song.spotifyTrackId ?? '').trim() == sharedTrackId) {
+          return song.id;
+        }
+      }
+    }
+
+    final String sharedTitle = _normalizeForMatch(
+      _sharedCurrentSongTitle ?? '',
+    );
+    final String sharedArtist = _normalizeForMatch(
+      _sharedCurrentSongArtist ?? '',
+    );
+    if (sharedTitle.isEmpty || sharedArtist.isEmpty) {
+      return null;
+    }
+
+    for (final Song song in _songs) {
+      if (_normalizeForMatch(song.title) == sharedTitle &&
+          _normalizeForMatch(song.artist) == sharedArtist) {
+        return song.id;
+      }
+    }
+    return null;
+  }
+
+  void _applySharedCurrentSongRef(Map<String, dynamic>? data) {
+    _sharedCurrentSongSpotifyTrackId =
+        data?['currentSongSpotifyTrackId'] as String?;
+    _sharedCurrentSongTitle = data?['currentSongTitle'] as String?;
+    _sharedCurrentSongArtist = data?['currentSongArtist'] as String?;
+    _currentSongId = _resolveCurrentSongIdFromSharedRef();
   }
 
   Song? get _currentSong {
@@ -548,18 +1012,6 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     );
   }
 
-  int get _currentSongPosition {
-    final String? currentId = _resolvedCurrentSongId;
-    if (currentId == null) {
-      return 0;
-    }
-    final int index = _songs.indexWhere((Song song) => song.id == currentId);
-    if (index < 0) {
-      return 0;
-    }
-    return index + 1;
-  }
-
   @override
   void initState() {
     super.initState();
@@ -569,7 +1021,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   @override
   void dispose() {
     unawaited(_spotifyPlayerStateSubscription?.cancel());
-    unawaited(_setlistSubscription?.cancel());
+    unawaited(_sharedSetlistSubscription?.cancel());
     unawaited(_songsSubscription?.cancel());
     super.dispose();
   }
@@ -587,7 +1039,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       _firebaseUserId = user.uid;
       await _syncSpotifyConnectionStatus();
       await _ensureCloudSetlistExists();
-      await _setlistSubscription?.cancel();
+      await _ensureSharedSetlistExists();
+      await _sharedSetlistSubscription?.cancel();
       await _songsSubscription?.cancel();
 
       final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
@@ -597,16 +1050,14 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         throw const FormatException('Missing Firestore setlist references');
       }
 
-      _setlistSubscription = setlistDoc.snapshots().listen((
+      _sharedSetlistSubscription = _sharedSetlistDoc.snapshots().listen((
         DocumentSnapshot<Map<String, dynamic>> snapshot,
       ) {
-        final String? remoteCurrentSongId =
-            snapshot.data()?['currentSongId'] as String?;
         if (!mounted) {
           return;
         }
         setState(() {
-          _currentSongId = remoteCurrentSongId;
+          _applySharedCurrentSongRef(snapshot.data());
         });
       });
 
@@ -630,10 +1081,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
               }
               setState(() {
                 _songs = loadedSongs;
-                if (_currentSongId != null &&
-                    !_songs.any((Song song) => song.id == _currentSongId)) {
-                  _currentSongId = _songs.isEmpty ? null : _songs.first.id;
-                }
+                _currentSongId = _resolveCurrentSongIdFromSharedRef();
                 _isLoading = false;
               });
             },
@@ -726,7 +1174,9 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         .trim();
     final String fallbackName = (payload?['id'] as String? ?? '').trim();
     final Object? rawImageUrl = payload?['imageUrl'];
-    final String imageUrlValue = rawImageUrl is String ? rawImageUrl.trim() : '';
+    final String imageUrlValue = rawImageUrl is String
+        ? rawImageUrl.trim()
+        : '';
     final String? imageUrl = imageUrlValue.isNotEmpty
         ? imageUrlValue
         : _firstSpotifyImageUrl(payload?['images']);
@@ -804,31 +1254,24 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   }
 
   String? _trackIdFromSpotifyUri(String? spotifyUri) {
-    final List<String> parts = (spotifyUri ?? '').trim().split(':');
-    if (parts.length < 3) {
-      return null;
-    }
-    final String type = parts[1].trim().toLowerCase();
-    if (type != 'track') {
-      return null;
-    }
-    final String trackId = parts[2].trim();
-    if (trackId.isEmpty) {
-      return null;
-    }
-    return trackId;
+    return _spotifyTrackIdFromSpotifyUri(spotifyUri);
   }
 
-  String? _spotifyUriForSong(Song song) {
-    final String directUri = (song.spotifyUri ?? '').trim();
-    if (directUri.isNotEmpty) {
-      return directUri;
+  List<String> _spotifyUrisForSong(Song song) {
+    final Set<String> uris = <String>{};
+
+    void addTrackId(String? rawTrackId) {
+      final String trackId = _sanitizeSpotifyTrackId(rawTrackId ?? '');
+      if (trackId.isEmpty) {
+        return;
+      }
+      uris.add(_spotifyPlayUriFromTrackId(trackId));
     }
-    final String trackId = (song.spotifyTrackId ?? '').trim();
-    if (trackId.isEmpty) {
-      return null;
-    }
-    return 'spotify:track:$trackId';
+
+    addTrackId(_spotifyTrackIdFromSpotifyUri(song.spotifyUri));
+    addTrackId(song.spotifyTrackId);
+    addTrackId(_spotifyTrackIdFromUrl(song.spotifyUrl));
+    return uris.toList(growable: false);
   }
 
   bool _isNotImplementedSpotifySdkError(Object error) {
@@ -838,8 +1281,152 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     if (error is PlatformException) {
       final String code = error.code.toLowerCase();
       final String message = (error.message ?? '').toLowerCase();
-      return code.contains('notimplemented') || message.contains('not implemented');
+      return code.contains('notimplemented') ||
+          message.contains('not implemented');
     }
+    return false;
+  }
+
+  String _spotifyPlaybackErrorHint(Object error) {
+    if (error is FormatException) {
+      final String message = error.message.trim();
+      return message.isEmpty ? '' : message;
+    }
+    if (error is PlatformException) {
+      final String code = error.code.trim();
+      final String message = (error.message ?? '').trim();
+      if (code.isNotEmpty && message.isNotEmpty) {
+        return '$code: $message';
+      }
+      if (message.isNotEmpty) {
+        return message;
+      }
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    return '';
+  }
+
+  bool _isSpotifyRemoteDisconnectedError(Object error) {
+    if (error is! PlatformException) {
+      return false;
+    }
+    final String code = error.code.toLowerCase();
+    final String message = (error.message ?? '').toLowerCase();
+    return code.contains('notconnected') ||
+        code.contains('disconnected') ||
+        message.contains('not connected') ||
+        message.contains('disconnected');
+  }
+
+  Future<void> _switchSpotifyToLocalDeviceIfPossible() async {
+    try {
+      await SpotifySdk.switchToLocalDevice();
+    } catch (_) {}
+  }
+
+  bool _playerStateMatchesTargetTrack(PlayerState? state, String spotifyUri) {
+    final String? targetTrackId = _spotifyTrackIdFromSpotifyUri(spotifyUri);
+    final String? activeTrackId = _trackIdFromSpotifyUri(state?.track?.uri);
+    if (targetTrackId == null || activeTrackId == null) {
+      return false;
+    }
+    return targetTrackId == activeTrackId;
+  }
+
+  Future<bool> _waitForPlaybackStart(String spotifyUri) async {
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final PlayerState? state = await SpotifySdk.getPlayerState();
+        final bool matchesTrack = _playerStateMatchesTargetTrack(
+          state,
+          spotifyUri,
+        );
+        final bool isPlaying = !(state?.isPaused ?? true);
+        if (matchesTrack && isPlaying) {
+          if (mounted) {
+            setState(() {
+              _spotifyPlayerState = state;
+            });
+          }
+          return true;
+        }
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    return false;
+  }
+
+  Future<void> _playSpotifyUriWithReconnect(String spotifyUri) async {
+    Future<void> playSequence() async {
+      await _switchSpotifyToLocalDeviceIfPossible();
+      await SpotifySdk.play(spotifyUri: spotifyUri);
+      bool started = await _waitForPlaybackStart(spotifyUri);
+      if (started) {
+        return;
+      }
+
+      await _switchSpotifyToLocalDeviceIfPossible();
+      await SpotifySdk.play(spotifyUri: spotifyUri);
+      started = await _waitForPlaybackStart(spotifyUri);
+      if (started) {
+        return;
+      }
+
+      try {
+        await SpotifySdk.resume();
+      } catch (_) {}
+      started = await _waitForPlaybackStart(spotifyUri);
+      if (!started) {
+        throw const FormatException(
+          'Spotify acknowledged play request but playback did not start.',
+        );
+      }
+    }
+
+    try {
+      await playSequence();
+    } catch (error) {
+      if (!_isSpotifyRemoteDisconnectedError(error)) {
+        rethrow;
+      }
+      if (!mounted) {
+        rethrow;
+      }
+      setState(() {
+        _spotifyPlayerReady = false;
+        _spotifyPlayerState = null;
+      });
+      await _ensureSpotifyPlayerConnected();
+      await playSequence();
+    }
+  }
+
+  Future<bool> _openSongInSpotifyApp(Song song) async {
+    final String sanitizedTrackId = _sanitizeSpotifyTrackId(
+      song.spotifyTrackId ?? '',
+    );
+    final String? trackId =
+        _spotifyTrackIdFromSpotifyUri(song.spotifyUri) ??
+        (sanitizedTrackId.isEmpty ? null : sanitizedTrackId) ??
+        _spotifyTrackIdFromUrl(song.spotifyUrl);
+    if (trackId == null || trackId.isEmpty) {
+      return false;
+    }
+    final Uri appUri = Uri.parse(_spotifyPlayUriFromTrackId(trackId));
+    final Uri webUri = Uri.https('open.spotify.com', '/track/$trackId');
+    try {
+      if (await launchUrl(appUri, mode: LaunchMode.externalApplication)) {
+        return true;
+      }
+    } catch (_) {}
+    try {
+      if (await launchUrl(webUri, mode: LaunchMode.externalApplication)) {
+        return true;
+      }
+    } catch (_) {}
     return false;
   }
 
@@ -894,27 +1481,16 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     if (!connected) {
       throw const FormatException('Could not connect to Spotify remote');
     }
+    await _switchSpotifyToLocalDeviceIfPossible();
     await _spotifyPlayerStateSubscription?.cancel();
     _spotifyPlayerStateSubscription = SpotifySdk.subscribePlayerState().listen(
       (PlayerState state) {
         if (!mounted) {
           return;
         }
-        final String? activeTrackId = _trackIdFromSpotifyUri(state.track?.uri);
-        String? nextCurrentSongId = _currentSongId;
-        if (activeTrackId != null) {
-          final Song? matchingSong = _songs.cast<Song?>().firstWhere(
-            (Song? song) => (song?.spotifyTrackId ?? '').trim() == activeTrackId,
-            orElse: () => null,
-          );
-          if (matchingSong != null) {
-            nextCurrentSongId = matchingSong.id;
-          }
-        }
         setState(() {
           _spotifyPlayerState = state;
           _spotifyPlayerReady = true;
-          _currentSongId = nextCurrentSongId;
         });
       },
       onError: (Object _) {
@@ -1005,31 +1581,53 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   }
 
   Future<void> _playSongInMiniPlayer(Song song) async {
-    final String? spotifyUri = _spotifyUriForSong(song);
-    if (spotifyUri == null) {
+    final List<String> playableUris = _spotifyUrisForSong(song);
+    if (playableUris.isEmpty) {
       setState(() {
         _spotifyPlayerErrorMessage = 'Song has no playable Spotify track id.';
       });
       return;
     }
     if (!_supportsSpotifyRemotePlayback) {
+      final bool openedInSpotifyApp = await _openSongInSpotifyApp(song);
       if (!mounted) {
         return;
       }
       setState(() {
-        _spotifyPlayerErrorMessage =
-            'In-app Spotify playback is unavailable on this platform.';
+        _spotifyPlayerErrorMessage = openedInSpotifyApp
+            ? 'In-app playback is unavailable here, opened song in Spotify app.'
+            : 'In-app Spotify playback is unavailable on this platform.';
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('In-app Spotify playback is unavailable on this platform.'),
+        SnackBar(
+          content: Text(
+            openedInSpotifyApp
+                ? 'Opened song in Spotify app.'
+                : 'In-app Spotify playback is unavailable on this platform.',
+          ),
         ),
       );
       return;
     }
     try {
       await _ensureSpotifyPlayerConnected();
-      await SpotifySdk.play(spotifyUri: spotifyUri);
+      Object? lastError;
+      bool played = false;
+      for (final String spotifyUri in playableUris) {
+        try {
+          await _playSpotifyUriWithReconnect(spotifyUri);
+          played = true;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!played) {
+        if (lastError != null) {
+          throw lastError;
+        }
+        throw const FormatException('No playable Spotify URI.');
+      }
       if (!mounted) {
         return;
       }
@@ -1037,41 +1635,21 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         _spotifyPlayerErrorMessage = null;
       });
     } catch (error) {
+      final bool openedInSpotifyApp = await _openSongInSpotifyApp(song);
+      final String errorHint = _spotifyPlaybackErrorHint(error);
       if (!mounted) {
         return;
       }
       setState(() {
         _spotifyPlayerErrorMessage = _isNotImplementedSpotifySdkError(error)
             ? 'In-app Spotify playback is unavailable in this build.'
-            : 'Could not start Spotify playback.';
+            : openedInSpotifyApp
+            ? 'In-app playback failed, opened the song in Spotify instead.'
+            : errorHint.isEmpty
+            ? 'Could not start Spotify playback. Keep Spotify app open and reconnect.'
+            : 'Could not start Spotify playback ($errorHint).';
       });
     }
-  }
-
-  Future<void> _toggleMiniPlayerPlayback() async {
-    try {
-      await _ensureSpotifyPlayerConnected();
-      final bool isPaused = _spotifyPlayerState?.isPaused ?? true;
-      if (isPaused) {
-        await SpotifySdk.resume();
-      } else {
-        await SpotifySdk.pause();
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _skipMiniPlayerNext() async {
-    try {
-      await _ensureSpotifyPlayerConnected();
-      await SpotifySdk.skipNext();
-    } catch (_) {}
-  }
-
-  Future<void> _skipMiniPlayerPrevious() async {
-    try {
-      await _ensureSpotifyPlayerConnected();
-      await SpotifySdk.skipPrevious();
-    } catch (_) {}
   }
 
   Future<void> _ensureCloudSetlistExists() async {
@@ -1079,36 +1657,56 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     if (setlistDoc == null) {
       return;
     }
-    final DocumentSnapshot<Map<String, dynamic>> snapshot =
-        await setlistDoc.get();
+    final DocumentSnapshot<Map<String, dynamic>> snapshot = await setlistDoc
+        .get();
     if (snapshot.exists) {
       return;
     }
     await setlistDoc.set(<String, dynamic>{
-      'currentSongId': null,
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  Future<void> _updateCurrentSongIdInCloud(String? currentSongId) async {
-    final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
-    if (setlistDoc == null) {
+  Future<void> _ensureSharedSetlistExists() async {
+    final DocumentSnapshot<Map<String, dynamic>> snapshot =
+        await _sharedSetlistDoc.get();
+    if (snapshot.exists) {
       return;
     }
-    await setlistDoc.set(<String, dynamic>{
-      'currentSongId': currentSongId,
+    await _sharedSetlistDoc.set(<String, dynamic>{
+      'currentSongSpotifyTrackId': null,
+      'currentSongTitle': null,
+      'currentSongArtist': null,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> _updateSharedCurrentSong(Song? song) async {
+    if (song == null) {
+      await _sharedSetlistDoc.set(<String, dynamic>{
+        'currentSongSpotifyTrackId': null,
+        'currentSongTitle': null,
+        'currentSongArtist': null,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      return;
+    }
+
+    final String spotifyTrackId = (song.spotifyTrackId ?? '').trim();
+    await _sharedSetlistDoc.set(<String, dynamic>{
+      'currentSongSpotifyTrackId': spotifyTrackId.isEmpty
+          ? null
+          : spotifyTrackId,
+      'currentSongTitle': song.title.trim(),
+      'currentSongArtist': song.artist.trim(),
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
 
-  Future<void> _replaceCloudState(
-    List<Song> songs,
-    String? currentSongId,
-  ) async {
+  Future<void> _replaceCloudSongs(List<Song> songs) async {
     final CollectionReference<Map<String, dynamic>>? songsCollection =
         _songsCollection;
-    final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
-    if (songsCollection == null || setlistDoc == null) {
+    if (songsCollection == null) {
       return;
     }
 
@@ -1117,8 +1715,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     final Set<String> nextSongIds = songs.map((Song song) => song.id).toSet();
 
     final WriteBatch batch = _firestore.batch();
-    for (final QueryDocumentSnapshot<Map<String, dynamic>>
-        existingSong in existingSongsSnapshot.docs) {
+    for (final QueryDocumentSnapshot<Map<String, dynamic>> existingSong
+        in existingSongsSnapshot.docs) {
       if (!nextSongIds.contains(existingSong.id)) {
         batch.delete(existingSong.reference);
       }
@@ -1133,21 +1731,67 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       }, SetOptions(merge: true));
     }
 
-    batch.set(setlistDoc, <String, dynamic>{
-      'currentSongId': currentSongId,
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
     await batch.commit();
   }
 
   void _setCurrentSong(String songId) {
-    if (!_songs.any((Song song) => song.id == songId)) {
+    final Song? song = _songById(songId);
+    if (song == null) {
       return;
     }
     setState(() {
-      _currentSongId = songId;
+      _sharedCurrentSongSpotifyTrackId = (song.spotifyTrackId ?? '').trim().isEmpty
+          ? null
+          : song.spotifyTrackId?.trim();
+      _sharedCurrentSongTitle = song.title.trim();
+      _sharedCurrentSongArtist = song.artist.trim();
+      _currentSongId = song.id;
     });
-    unawaited(_updateCurrentSongIdInCloud(songId));
+    unawaited(_updateSharedCurrentSong(song));
+  }
+
+  Future<void> _confirmSetCurrentSong(String songId) async {
+    final Song? song = _songById(songId);
+    if (song == null) {
+      return;
+    }
+    if (song.id == _resolvedCurrentSongId) {
+      return;
+    }
+
+    final bool confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (BuildContext context) {
+            return AlertDialog(
+              backgroundColor: _appSurfaceStrong,
+              title: const Center(
+                child: Text('Set current song?'),
+              ),
+              actionsAlignment: MainAxisAlignment.center,
+              actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('No'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop(true),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _appPrimary,
+                    foregroundColor: const Color(0xFF171717),
+                  ),
+                  child: const Text('Yes'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+    if (!confirmed || !mounted) {
+      return;
+    }
+    _setCurrentSong(songId);
   }
 
   int _findSongMatchIndex(Song incomingSong) {
@@ -1178,36 +1822,35 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     final List<Song> nextSongs = List<Song>.from(_songs);
     int addedCount = 0;
     int updatedCount = 0;
-    String? focusSongId;
 
     for (final Song song in importedSongs) {
       final int existingIndex = _findSongMatchIndex(song);
       if (existingIndex < 0) {
         nextSongs.add(song);
         addedCount += 1;
-        focusSongId = song.id;
         continue;
       }
 
       final Song existingSong = nextSongs[existingIndex];
       final Song mergedSong = Song(
         id: existingSong.id,
-        title:
-            song.title.trim().isEmpty ? existingSong.title : song.title.trim(),
-        artist:
-            song.artist.trim().isEmpty
-                ? existingSong.artist
-                : song.artist.trim(),
-        duration:
-            song.duration.trim().isEmpty
-                ? existingSong.duration
-                : song.duration.trim(),
+        title: song.title.trim().isEmpty
+            ? existingSong.title
+            : song.title.trim(),
+        artist: song.artist.trim().isEmpty
+            ? existingSong.artist
+            : song.artist.trim(),
+        duration: song.duration.trim().isEmpty
+            ? existingSong.duration
+            : song.duration.trim(),
         key: existingSong.key,
         bpm: existingSong.bpm,
-        spotifyUrl:
-            song.spotifyUrl.trim().isEmpty
-                ? existingSong.spotifyUrl
-                : song.spotifyUrl.trim(),
+        spotifyUrl: song.spotifyUrl.trim().isEmpty
+            ? existingSong.spotifyUrl
+            : song.spotifyUrl.trim(),
+        modifier: song.modifier.trim().isEmpty
+            ? existingSong.modifier
+            : song.modifier.trim(),
         notes: existingSong.notes,
         artworkUrl: song.artworkUrl ?? existingSong.artworkUrl,
         roles: existingSong.roles,
@@ -1219,17 +1862,33 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       );
       nextSongs[existingIndex] = mergedSong;
       updatedCount += 1;
-      focusSongId = mergedSong.id;
     }
 
-    final String? nextCurrentSongId = focusSongId ?? _currentSongId;
     setState(() {
       _songs = nextSongs;
-      _currentSongId = nextCurrentSongId;
-      _tabIndex = 0;
+      _tabIndex = 1;
     });
-    unawaited(_replaceCloudState(nextSongs, nextCurrentSongId));
-    return _ImportMergeResult(addedCount: addedCount, updatedCount: updatedCount);
+    unawaited(_replaceCloudSongs(nextSongs));
+    return _ImportMergeResult(
+      addedCount: addedCount,
+      updatedCount: updatedCount,
+    );
+  }
+
+  void _reorderSongs(int oldIndex, int newIndex) {
+    if (oldIndex < 0 ||
+        newIndex < 0 ||
+        oldIndex >= _songs.length ||
+        newIndex >= _songs.length) {
+      return;
+    }
+    final List<Song> nextSongs = List<Song>.from(_songs);
+    final Song movedSong = nextSongs.removeAt(oldIndex);
+    nextSongs.insert(newIndex, movedSong);
+    setState(() {
+      _songs = nextSongs;
+    });
+    unawaited(_replaceCloudSongs(nextSongs));
   }
 
   void _removeSong(String songId) {
@@ -1246,19 +1905,60 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         .where((Song song) => song.id != songId)
         .toList(growable: false);
 
-    String? nextCurrentSongId = _currentSongId;
+    Song? nextCurrentSong;
     if (nextSongs.isEmpty) {
-      nextCurrentSongId = null;
+      nextCurrentSong = null;
     } else if (removedCurrentSong) {
       final int fallbackIndex = min(indexToRemove, nextSongs.length - 1);
-      nextCurrentSongId = nextSongs[fallbackIndex].id;
+      nextCurrentSong = nextSongs[fallbackIndex];
     }
 
     setState(() {
       _songs = nextSongs;
-      _currentSongId = nextCurrentSongId;
+      if (removedCurrentSong) {
+        if (nextCurrentSong == null) {
+          _sharedCurrentSongSpotifyTrackId = null;
+          _sharedCurrentSongTitle = null;
+          _sharedCurrentSongArtist = null;
+          _currentSongId = null;
+        } else {
+          _sharedCurrentSongSpotifyTrackId =
+              (nextCurrentSong.spotifyTrackId ?? '').trim().isEmpty
+              ? null
+              : nextCurrentSong.spotifyTrackId?.trim();
+          _sharedCurrentSongTitle = nextCurrentSong.title.trim();
+          _sharedCurrentSongArtist = nextCurrentSong.artist.trim();
+          _currentSongId = nextCurrentSong.id;
+        }
+      }
     });
-    unawaited(_replaceCloudState(nextSongs, nextCurrentSongId));
+    unawaited(_replaceCloudSongs(nextSongs));
+    if (removedCurrentSong) {
+      unawaited(_updateSharedCurrentSong(nextCurrentSong));
+    }
+  }
+
+  Future<void> _editSong(Song song) async {
+    final Song? editedSong = await Navigator.of(context).push<Song>(
+      MaterialPageRoute<Song>(
+        fullscreenDialog: true,
+        builder: (BuildContext context) => _EditSongPage(song: song),
+      ),
+    );
+    if (editedSong == null) {
+      return;
+    }
+    final int songIndex = _songs.indexWhere((Song item) => item.id == song.id);
+    if (songIndex < 0) {
+      return;
+    }
+    final List<Song> nextSongs = List<Song>.from(_songs);
+    nextSongs[songIndex] = editedSong;
+    setState(() {
+      _songs = nextSongs;
+      _currentSongId = _resolveCurrentSongIdFromSharedRef();
+    });
+    unawaited(_replaceCloudSongs(nextSongs));
   }
 
   void _stepCurrentSong(int delta) {
@@ -1273,9 +1973,29 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     }
 
     final int nextIndex = (index + delta + _songs.length) % _songs.length;
+    if (nextIndex == index) {
+      return;
+    }
     _setCurrentSong(_songs[nextIndex].id);
   }
 
+  Song? _adjacentSong(int delta) {
+    final String? currentId = _resolvedCurrentSongId;
+    if (currentId == null || _songs.isEmpty) {
+      return null;
+    }
+
+    final int index = _songs.indexWhere((Song song) => song.id == currentId);
+    if (index < 0) {
+      return null;
+    }
+
+    final int adjacentIndex = (index + delta + _songs.length) % _songs.length;
+    if (adjacentIndex == index) {
+      return null;
+    }
+    return _songs[adjacentIndex];
+  }
 
   Future<void> _showSongPickerModal() async {
     if (_songs.isEmpty) {
@@ -1346,7 +2066,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     if (selectedSongId == null) {
       return;
     }
-    _setCurrentSong(selectedSongId);
+    await _confirmSetCurrentSong(selectedSongId);
   }
 
   void _selectBottomAction(int index) {
@@ -1390,25 +2110,29 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         child: CircularProgressIndicator(color: _appPrimary),
       );
     } else if (_tabIndex == 0) {
-      bodyContent = SetlistPage(
-        songs: _songs,
-        currentSong: _currentSong,
-        totalRuntime: _formatRuntime(_totalRuntimeSeconds),
-        onSelectSong: _setCurrentSong,
-        onRemoveSong: _removeSong,
-        onPlaySpotify: _playSongInMiniPlayer,
-      );
-    } else if (_tabIndex == 1) {
       bodyContent = _SongImporterPage(
         onSongsImported: _upsertImportedSongs,
         spotifySessionId: _spotifySessionId,
         spotifyAccountConnected: _spotifyAccountConnected,
       );
-    } else {
-      bodyContent = _CurrentSongPage(
+    } else if (_tabIndex == 1) {
+      bodyContent = SetlistPage(
         songs: _songs,
         currentSong: _currentSong,
-        currentSongPosition: _currentSongPosition,
+        totalRuntime: _formatRuntime(_totalRuntimeSeconds),
+        spotifyAccountConnected: _spotifyAccountConnected,
+        supportsSpotifyRemotePlayback: _supportsSpotifyRemotePlayback,
+        onSelectSong: _confirmSetCurrentSong,
+        onRemoveSong: _removeSong,
+        onEditSong: _editSong,
+        onPlaySpotify: _playSongInMiniPlayer,
+        onReorderSongs: _reorderSongs,
+      );
+    } else {
+      bodyContent = _CurrentSongPage(
+        currentSong: _currentSong,
+        previousSong: _adjacentSong(-1),
+        nextSong: _adjacentSong(1),
         onPreviousSong: () => _stepCurrentSong(-1),
         onNextSong: () => _stepCurrentSong(1),
         onPlaySpotify: _playSongInMiniPlayer,
@@ -1442,13 +2166,26 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
                           (_spotifyProfileName ?? '').trim().isNotEmpty
                       ? _spotifyProfileName!.trim()
                       : 'Band setlist companion',
-                  imageUrl: _spotifyAccountConnected ? _spotifyProfileImageUrl : null,
+                  imageUrl: _spotifyAccountConnected
+                      ? _spotifyProfileImageUrl
+                      : null,
                   trailing: topBarTrailing,
                 ),
               ),
               Expanded(
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 220),
+                  layoutBuilder:
+                      (Widget? currentChild, List<Widget> previousChildren) {
+                        return Stack(
+                          fit: StackFit.expand,
+                          alignment: Alignment.topCenter,
+                          children: <Widget>[
+                            ...previousChildren,
+                            if (currentChild != null) currentChild,
+                          ],
+                        );
+                      },
                   child: bodyContent,
                 ),
               ),
@@ -1456,115 +2193,370 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
           ),
         ),
       ),
-      bottomNavigationBar: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          if (_spotifyAccountConnected && _supportsSpotifyRemotePlayback)
-            _SpotifyMiniPlayerBar(
-              playerState: _spotifyPlayerState,
-              isConnecting: _isPlayerConnecting,
-              errorMessage: _spotifyPlayerErrorMessage,
-              onPlayPausePressed: _toggleMiniPlayerPlayback,
-              onPreviousPressed: _skipMiniPlayerPrevious,
-              onNextPressed: _skipMiniPlayerNext,
+      bottomNavigationBar: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            if (_currentSong != null)
+              _CurrentSongBar(
+                song: _currentSong!,
+                playerState: _spotifyPlayerState,
+                isConnecting: _isPlayerConnecting,
+                errorMessage: _spotifyPlayerErrorMessage,
+                onPressed: () => _selectBottomAction(2),
+              ),
+            _BottomActionBar(
+              activeIndex: _tabIndex,
+              onActionPressed: _selectBottomAction,
+              margin: EdgeInsets.fromLTRB(
+                14,
+                _currentSong == null ? 8 : 0,
+                14,
+                12,
+              ),
+              showCurrentSongConnector: _currentSong != null,
+              highlightCurrentSongAction: _currentSong != null,
             ),
-          _BottomActionBar(
-            activeIndex: _tabIndex,
-            onActionPressed: _selectBottomAction,
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
-class SetlistPage extends StatelessWidget {
+class SetlistPage extends StatefulWidget {
   const SetlistPage({
     super.key,
     required this.songs,
     required this.currentSong,
     required this.totalRuntime,
+    required this.spotifyAccountConnected,
+    required this.supportsSpotifyRemotePlayback,
     required this.onSelectSong,
     required this.onRemoveSong,
+    required this.onEditSong,
     required this.onPlaySpotify,
+    required this.onReorderSongs,
   });
 
   final List<Song> songs;
   final Song? currentSong;
   final String totalRuntime;
-  final ValueChanged<String> onSelectSong;
+  final bool spotifyAccountConnected;
+  final bool supportsSpotifyRemotePlayback;
+  final Future<void> Function(String songId) onSelectSong;
   final ValueChanged<String> onRemoveSong;
+  final ValueChanged<Song> onEditSong;
   final Future<void> Function(Song song) onPlaySpotify;
+  final void Function(int oldIndex, int newIndex) onReorderSongs;
 
   @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Text(
-            'Songs ${songs.length} • Runtime $totalRuntime',
-            style: const TextStyle(color: _appMutedText, fontSize: 13),
-          ),
-          const SizedBox(height: 12),
-          _SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const _SectionLabel(text: 'Setlist'),
-                const SizedBox(height: 10),
-                if (songs.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 18),
-                    child: Text(
-                      'No songs yet. Use Importer to add one.',
-                      style: TextStyle(color: _appMutedText),
-                    ),
-                  )
-                else
-                  Column(
-                    children: songs.asMap().entries.map((
-                      MapEntry<int, Song> entry,
-                    ) {
-                      final int index = entry.key;
-                      final Song song = entry.value;
-                      final bool isCurrent = currentSong?.id == song.id;
+  State<SetlistPage> createState() => _SetlistPageState();
+}
 
-                      return Container(
-                        margin: EdgeInsets.only(
-                          bottom: index == songs.length - 1 ? 0 : 10,
+class _SetlistPageState extends State<SetlistPage> {
+  String? _expandedSongId;
+
+  @override
+  void didUpdateWidget(covariant SetlistPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_expandedSongId != null &&
+        !widget.songs.any((Song song) => song.id == _expandedSongId)) {
+      _expandedSongId = null;
+    }
+  }
+
+  void _toggleExpandedSong(String songId) {
+    setState(() {
+      _expandedSongId = _expandedSongId == songId ? null : songId;
+    });
+  }
+
+  void _playSongFromCard(Song song) {
+    unawaited(widget.onPlaySpotify(song));
+  }
+
+  void _handleReorderItem(int oldIndex, int newIndex) {
+    if (oldIndex == newIndex) {
+      return;
+    }
+    widget.onReorderSongs(oldIndex, newIndex);
+  }
+
+  Widget _buildExpandedDetails(Song song, bool isCurrent) {
+    final bool hasPlayableTrack = _songHasPlayableSpotifyTrack(song);
+    final bool canAttemptInAppPlayback =
+        hasPlayableTrack &&
+        widget.spotifyAccountConnected &&
+        widget.supportsSpotifyRemotePlayback;
+    final String playLabel = !hasPlayableTrack
+        ? 'No track'
+        : canAttemptInAppPlayback
+        ? 'Play'
+        : widget.supportsSpotifyRemotePlayback
+        ? 'Connect'
+        : 'Open';
+    final IconData playIcon = !hasPlayableTrack
+        ? Icons.music_off_rounded
+        : canAttemptInAppPlayback
+        ? Icons.play_arrow_rounded
+        : widget.supportsSpotifyRemotePlayback
+        ? Icons.link_rounded
+        : Icons.open_in_new_rounded;
+    final VoidCallback? playAction = hasPlayableTrack
+        ? () => _playSongFromCard(song)
+        : null;
+    final List<String> quickFacts = <String>[
+      if (song.key.trim().isNotEmpty) 'Key ${song.key.trim()}',
+      if (song.bpm.trim().isNotEmpty) '${song.bpm.trim()} BPM',
+    ];
+    final bool hasExtraDetails =
+        quickFacts.isNotEmpty ||
+        song.modifier.trim().isNotEmpty ||
+        song.roles.isNotEmpty ||
+        song.notes.trim().isNotEmpty;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Container(
+            decoration: BoxDecoration(
+              color: _appSurface.withValues(alpha: 0.55),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+            ),
+            child: Row(
+              children: <Widget>[
+                _SetlistActionBarButton(
+                  icon: isCurrent
+                      ? Icons.equalizer_rounded
+                      : Icons.radio_button_unchecked_rounded,
+                  label: isCurrent ? 'Current' : 'Set current',
+                  highlighted: isCurrent,
+                  onPressed: () => unawaited(widget.onSelectSong(song.id)),
+                ),
+                _SetlistActionBarButton(
+                  icon: playIcon,
+                  label: playLabel,
+                  highlighted: hasPlayableTrack,
+                  onPressed: playAction,
+                ),
+                _SetlistActionBarButton(
+                  icon: Icons.edit_rounded,
+                  label: 'Edit',
+                  onPressed: () => widget.onEditSong(song),
+                ),
+                _SetlistActionBarButton(
+                  icon: Icons.delete_outline_rounded,
+                  label: 'Remove',
+                  danger: true,
+                  onPressed: () => widget.onRemoveSong(song.id),
+                ),
+              ],
+            ),
+          ),
+          if (!hasExtraDetails) ...<Widget>[
+            const SizedBox(height: 10),
+            const Text(
+              'No additional details yet.',
+              style: TextStyle(color: _appMutedText, fontSize: 12),
+            ),
+          ] else ...<Widget>[
+            if (quickFacts.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: quickFacts.map((String label) {
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.06),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      label,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: _appMutedText,
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ],
+            if (song.modifier.trim().isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              const Text(
+                'Modifier',
+                style: TextStyle(
+                  color: _appMutedText,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                song.modifier.trim(),
+                style: const TextStyle(fontSize: 13, height: 1.35),
+              ),
+            ],
+            if (song.roles.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              const Text(
+                'Instrument roles',
+                style: TextStyle(
+                  color: _appMutedText,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const SizedBox(height: 4),
+              ...song.roles.asMap().entries.map((
+                MapEntry<int, RoleAssignment> entry,
+              ) {
+                final RoleAssignment role = entry.value;
+                final String roleLabel = [role.instrument, role.player]
+                    .map((String value) => value.trim())
+                    .where((String value) => value.isNotEmpty)
+                    .join(' • ');
+                final bool hasChartLink =
+                    _parseExternalHttpUri(role.chartUrl) != null;
+                return Padding(
+                  padding: EdgeInsets.only(
+                    bottom: entry.key == song.roles.length - 1 ? 0 : 4,
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: <Widget>[
+                      Expanded(
+                        child: Text(
+                          roleLabel.isEmpty ? 'Unnamed role' : roleLabel,
+                          style: const TextStyle(fontSize: 12),
                         ),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: isCurrent
-                              ? _appAccent.withValues(alpha: 0.3)
-                              : _appSurfaceStrong.withValues(alpha: 0.78),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                            color: isCurrent
-                                ? _appPrimary.withValues(alpha: 0.6)
-                                : Colors.white.withValues(alpha: 0.08),
-                          ),
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            CircleAvatar(
-                              radius: 14,
-                              backgroundColor: isCurrent
-                                  ? _appPrimary
-                                  : _appAccent.withValues(alpha: 0.7),
-                              child: Text(
-                                '${index + 1}',
-                                style: TextStyle(
-                                  color: isCurrent
-                                      ? Colors.black
-                                      : Colors.white,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 12,
-                                ),
+                      ),
+                      if (hasChartLink)
+                        TextButton.icon(
+                          onPressed: () {
+                            unawaited(
+                              _openExternalLink(
+                                context,
+                                role.chartUrl,
+                                failureMessage:
+                                    'Could not open chords/tab link.',
                               ),
+                            );
+                          },
+                          style: TextButton.styleFrom(
+                            foregroundColor: _appPrimary,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 0,
+                            ),
+                            minimumSize: const Size(0, 28),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          icon: const Icon(Icons.link_rounded, size: 14),
+                          label: const Text('Chords/tab'),
+                        ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+            if (song.notes.trim().isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              const Text(
+                'Notes',
+                style: TextStyle(
+                  color: _appMutedText,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                song.notes.trim(),
+                style: const TextStyle(
+                  color: _appMutedText,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
+              ),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSongCard({
+    required Key key,
+    required int index,
+    required Song song,
+    required bool isCurrent,
+    required bool isExpanded,
+  }) {
+    final List<String> metadataLabels = <String>[
+      if (song.key.trim().isNotEmpty) 'Key ${song.key.trim()}',
+      if (song.bpm.trim().isNotEmpty) '${song.bpm.trim()} BPM',
+    ];
+
+    return Padding(
+      key: key,
+      padding: EdgeInsets.only(
+        bottom: index == widget.songs.length - 1 ? 0 : 10,
+      ),
+      child: Container(
+        decoration: BoxDecoration(
+          color: isCurrent
+              ? _appAccent.withValues(alpha: 0.3)
+              : _appSurfaceStrong.withValues(alpha: 0.78),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: isCurrent
+                ? _appPrimary.withValues(alpha: 0.6)
+                : Colors.white.withValues(alpha: 0.08),
+          ),
+        ),
+        child: Column(
+          children: <Widget>[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: <Widget>[
+                ReorderableDragStartListener(
+                  index: index,
+                  child: const Padding(
+                    padding: EdgeInsets.fromLTRB(6, 10, 0, 10),
+                    child: Icon(
+                      Icons.drag_handle_rounded,
+                      color: _appMutedText,
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => _playSongFromCard(song),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(0, 10, 0, 10),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: <Widget>[
+                            _SongArtworkThumbnail(
+                              artworkUrl: song.artworkUrl,
+                              isCurrent: isCurrent,
                             ),
                             const SizedBox(width: 10),
                             Expanded(
@@ -1573,87 +2565,200 @@ class SetlistPage extends StatelessWidget {
                                 children: <Widget>[
                                   Text(
                                     song.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
                                       fontWeight: FontWeight.w700,
-                                      fontSize: 16,
+                                      fontSize: 15,
                                     ),
                                   ),
                                   const SizedBox(height: 2),
                                   Text(
                                     song.artist,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
                                       color: _appMutedText,
+                                      fontSize: 13,
                                     ),
                                   ),
-                                  const SizedBox(height: 6),
-                                  Wrap(
-                                    spacing: 6,
-                                    runSpacing: 6,
-                                    children:
-                                        <String>[
-                                          if (song.duration.trim().isNotEmpty)
-                                            song.duration.trim(),
-                                          if (song.key.trim().isNotEmpty)
-                                            'Key ${song.key.trim()}',
-                                          if (song.bpm.trim().isNotEmpty)
-                                            '${song.bpm.trim()} BPM',
-                                        ].map((String label) {
-                                          return Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 8,
-                                              vertical: 4,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Colors.white.withValues(
-                                                alpha: 0.06,
-                                              ),
-                                              borderRadius:
-                                                  BorderRadius.circular(999),
-                                            ),
-                                            child: Text(
-                                              label,
-                                              style: const TextStyle(
-                                                fontSize: 11,
-                                                color: _appMutedText,
-                                              ),
-                                            ),
-                                          );
-                                        }).toList(),
-                                  ),
+                                  if (metadataLabels.isNotEmpty) ...<Widget>[
+                                    const SizedBox(height: 5),
+                                    Text(
+                                      metadataLabels.join(' • '),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: _appMutedText,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),
-                            Column(
-                              children: <Widget>[
-                                IconButton(
-                                  icon: const Icon(Icons.radio_button_checked_rounded),
-                                  tooltip: 'Set as current song',
-                                  onPressed: () => onSelectSong(song.id),
-                                ),
-                                if (song.spotifyUrl.trim().isNotEmpty)
-                                  IconButton(
-                                    icon: const Icon(Icons.play_arrow_rounded),
-                                    tooltip: 'Play in app',
-                                    onPressed: () => onPlaySpotify(song),
-                                  ),
-                                IconButton(
-                                  icon: const Icon(
-                                    Icons.delete_outline_rounded,
-                                  ),
-                                  tooltip: 'Remove song',
-                                  onPressed: () => onRemoveSong(song.id),
-                                ),
-                              ],
-                            ),
                           ],
                         ),
-                      );
-                    }).toList(),
+                      ),
+                    ),
                   ),
+                ),
+                IconButton(
+                  onPressed: () => _toggleExpandedSong(song.id),
+                  tooltip: isExpanded ? 'Hide details' : 'Show details',
+                  icon: Icon(
+                    isExpanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    color: isCurrent ? _appPrimary : _appMutedText,
+                  ),
+                ),
               ],
             ),
+            AnimatedCrossFade(
+              firstChild: const SizedBox.shrink(),
+              secondChild: _buildExpandedDetails(song, isCurrent),
+              crossFadeState: isExpanded
+                  ? CrossFadeState.showSecond
+                  : CrossFadeState.showFirst,
+              duration: const Duration(milliseconds: 180),
+              sizeCurve: Curves.easeInOut,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const _PageTitleHeading(text: 'Setlist'),
+              const SizedBox(height: 6),
+              Text(
+                'Songs ${widget.songs.length} • Runtime ${widget.totalRuntime}',
+                style: const TextStyle(color: _appMutedText, fontSize: 13),
+              ),
+            ],
           ),
-          const SizedBox(height: 84),
+        ),
+        const SizedBox(height: 12),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+            child: Card(
+              clipBehavior: Clip.antiAlias,
+              margin: EdgeInsets.zero,
+              child: widget.songs.isEmpty
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Text(
+                          'No songs yet. Use Importer to add one.',
+                          style: TextStyle(color: _appMutedText),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    )
+                  : ReorderableListView.builder(
+                      buildDefaultDragHandles: false,
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 84),
+                      itemCount: widget.songs.length,
+                      onReorderItem: _handleReorderItem,
+                      proxyDecorator:
+                          (Widget child, int index, Animation<double> animation) {
+                            return Material(
+                              color: Colors.transparent,
+                              elevation: 6,
+                              shadowColor: Colors.black.withValues(alpha: 0.35),
+                              borderRadius: BorderRadius.circular(16),
+                              child: child,
+                            );
+                          },
+                      itemBuilder: (BuildContext context, int index) {
+                        final Song song = widget.songs[index];
+                        final bool isCurrent =
+                            widget.currentSong?.id == song.id;
+                        final bool isExpanded = _expandedSongId == song.id;
+                        return _buildSongCard(
+                          key: ValueKey<String>(song.id),
+                          index: index,
+                          song: song,
+                          isCurrent: isCurrent,
+                          isExpanded: isExpanded,
+                        );
+                      },
+                    ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _AdjacentSongButton extends StatelessWidget {
+  const _AdjacentSongButton({
+    required this.directionLabel,
+    required this.song,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final String directionLabel;
+  final Song? song;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isEnabled = song != null;
+    return OutlinedButton(
+      onPressed: isEnabled ? onPressed : null,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: Colors.white,
+        disabledForegroundColor: _appMutedText.withValues(alpha: 0.55),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        side: BorderSide(color: Colors.white.withValues(alpha: 0.15)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(icon, size: 18),
+              const SizedBox(width: 4),
+              Text(
+                directionLabel,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          if (song != null) ...<Widget>[
+            const SizedBox(height: 4),
+            Text(
+              song!.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1662,18 +2767,18 @@ class SetlistPage extends StatelessWidget {
 
 class _CurrentSongPage extends StatelessWidget {
   const _CurrentSongPage({
-    required this.songs,
     required this.currentSong,
-    required this.currentSongPosition,
+    required this.previousSong,
+    required this.nextSong,
     required this.onPreviousSong,
     required this.onNextSong,
     required this.onPlaySpotify,
     required this.onOpenSongPicker,
   });
 
-  final List<Song> songs;
   final Song? currentSong;
-  final int currentSongPosition;
+  final Song? previousSong;
+  final Song? nextSong;
   final VoidCallback onPreviousSong;
   final VoidCallback onNextSong;
   final Future<void> Function(Song song) onPlaySpotify;
@@ -1686,6 +2791,8 @@ class _CurrentSongPage extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
+          const _PageTitleHeading(text: 'Current song'),
+          const SizedBox(height: 12),
           _SectionCard(
             child: currentSong == null
                 ? const Padding(
@@ -1700,17 +2807,6 @@ class _CurrentSongPage extends StatelessWidget {
                 : Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
-                      const _SectionLabel(text: 'Current Song'),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Song $currentSongPosition of ${songs.length}',
-                        style: const TextStyle(
-                          color: _appMutedText,
-                          fontSize: 12,
-                          letterSpacing: 0.7,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
                       Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
@@ -1757,6 +2853,42 @@ class _CurrentSongPage extends StatelessWidget {
                             ),
                         ],
                       ),
+                      if (currentSong!.modifier.trim().isNotEmpty) ...<Widget>[
+                        const SizedBox(height: 12),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: _appSurfaceStrong.withValues(alpha: 0.7),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.08),
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              const Text(
+                                'Modifier',
+                                style: TextStyle(
+                                  color: _appMutedText,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                currentSong!.modifier.trim(),
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  height: 1.35,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 12),
                       if (currentSong!.roles.isEmpty)
                         const Text(
@@ -1764,20 +2896,65 @@ class _CurrentSongPage extends StatelessWidget {
                           style: TextStyle(color: _appMutedText),
                         )
                       else
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: currentSong!.roles.map((
-                            RoleAssignment role,
+                        Column(
+                          children: currentSong!.roles.asMap().entries.map((
+                            MapEntry<int, RoleAssignment> entry,
                           ) {
-                            return Chip(
-                              backgroundColor: _appSurfaceStrong,
-                              side: BorderSide(
-                                color: Colors.white.withValues(alpha: 0.08),
+                            final RoleAssignment role = entry.value;
+                            final bool hasChartLink =
+                                _parseExternalHttpUri(role.chartUrl) != null;
+                            return Container(
+                              width: double.infinity,
+                              margin: EdgeInsets.only(
+                                bottom:
+                                    entry.key == currentSong!.roles.length - 1
+                                    ? 0
+                                    : 8,
                               ),
-                              label: Text(
-                                '${role.instrument}: ${role.player}',
-                                style: const TextStyle(fontSize: 12),
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: _appSurfaceStrong,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: Colors.white.withValues(alpha: 0.08),
+                                ),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    '${role.instrument}: ${role.player}',
+                                    style: const TextStyle(fontSize: 13),
+                                  ),
+                                  if (hasChartLink) ...<Widget>[
+                                    const SizedBox(height: 4),
+                                    TextButton.icon(
+                                      onPressed: () {
+                                        unawaited(
+                                          _openExternalLink(
+                                            context,
+                                            role.chartUrl,
+                                            failureMessage:
+                                                'Could not open chords/tab link.',
+                                          ),
+                                        );
+                                      },
+                                      style: TextButton.styleFrom(
+                                        foregroundColor: _appPrimary,
+                                        padding: EdgeInsets.zero,
+                                        minimumSize: const Size(0, 30),
+                                        alignment: Alignment.centerLeft,
+                                        tapTargetSize:
+                                            MaterialTapTargetSize.shrinkWrap,
+                                      ),
+                                      icon: const Icon(
+                                        Icons.link_rounded,
+                                        size: 16,
+                                      ),
+                                      label: const Text('Open chords/tab link'),
+                                    ),
+                                  ],
+                                ],
                               ),
                             );
                           }).toList(),
@@ -1797,30 +2974,20 @@ class _CurrentSongPage extends StatelessWidget {
                       Row(
                         children: <Widget>[
                           Expanded(
-                            child: OutlinedButton.icon(
+                            child: _AdjacentSongButton(
+                              directionLabel: 'Previous',
+                              song: previousSong,
+                              icon: Icons.skip_previous_rounded,
                               onPressed: onPreviousSong,
-                              icon: const Icon(Icons.skip_previous_rounded),
-                              label: const Text('Previous'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.white,
-                                side: BorderSide(
-                                  color: Colors.white.withValues(alpha: 0.15),
-                                ),
-                              ),
                             ),
                           ),
                           const SizedBox(width: 10),
                           Expanded(
-                            child: OutlinedButton.icon(
+                            child: _AdjacentSongButton(
+                              directionLabel: 'Next',
+                              song: nextSong,
+                              icon: Icons.skip_next_rounded,
                               onPressed: onNextSong,
-                              icon: const Icon(Icons.skip_next_rounded),
-                              label: const Text('Next'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.white,
-                                side: BorderSide(
-                                  color: Colors.white.withValues(alpha: 0.15),
-                                ),
-                              ),
                             ),
                           ),
                         ],
@@ -1833,7 +3000,7 @@ class _CurrentSongPage extends StatelessWidget {
                             unawaited(onOpenSongPicker());
                           },
                           icon: const Icon(Icons.library_music_rounded),
-                          label: const Text('Choose current song'),
+                          label: const Text('Select another song'),
                           style: OutlinedButton.styleFrom(
                             foregroundColor: Colors.white,
                             side: BorderSide(
@@ -1842,9 +3009,9 @@ class _CurrentSongPage extends StatelessWidget {
                           ),
                         ),
                       ),
-                      if (currentSong!.spotifyUrl
-                          .trim()
-                          .isNotEmpty) ...<Widget>[
+                      if (_songHasPlayableSpotifyTrack(
+                        currentSong!,
+                      )) ...<Widget>[
                         const SizedBox(height: 8),
                         SizedBox(
                           width: double.infinity,
@@ -1870,20 +3037,412 @@ class _CurrentSongPage extends StatelessWidget {
 }
 
 enum _ImportState { idle, loading, success, error }
+
 enum _ImporterStep { choose, link, account, details }
 
+List<_RoleDraft> _buildPresetEditSongRoleDrafts(List<RoleAssignment> existingRoles) {
+  final Map<String, RoleAssignment> rolesByInstrument = <String, RoleAssignment>{};
+  final List<RoleAssignment> customRoles = <RoleAssignment>[];
+
+  for (final RoleAssignment role in existingRoles) {
+    final String instrument = role.instrument.trim();
+    if (_editableInstrumentOptions.contains(instrument)) {
+      rolesByInstrument[instrument] = role;
+    } else if (instrument.isNotEmpty || role.player.trim().isNotEmpty) {
+      customRoles.add(role);
+    }
+  }
+
+  final List<_RoleDraft> drafts = _editableInstrumentOptions
+      .map((String instrument) {
+        final RoleAssignment? existing = rolesByInstrument[instrument];
+        if (existing != null) {
+          return _RoleDraft(
+            id: existing.id,
+            instrument: instrument,
+            player: existing.player,
+            chartUrl: existing.chartUrl,
+            isPreset: true,
+          );
+        }
+        return _RoleDraft(
+          id: _createId('role'),
+          instrument: instrument,
+          isPreset: true,
+        );
+      })
+      .toList(growable: true);
+
+  for (final RoleAssignment role in customRoles) {
+    drafts.add(
+      _RoleDraft(
+        id: role.id,
+        instrument: role.instrument,
+        player: role.player,
+        chartUrl: role.chartUrl,
+      ),
+    );
+  }
+
+  return drafts;
+}
+
 class _RoleDraft {
-  _RoleDraft({required this.id, String instrument = '', String player = ''})
-    : instrumentController = TextEditingController(text: instrument),
-      playerController = TextEditingController(text: player);
+  _RoleDraft({
+    required this.id,
+    String instrument = '',
+    String player = '',
+    String chartUrl = '',
+    this.isPreset = false,
+  }) : instrumentController = TextEditingController(text: instrument),
+       playerController = TextEditingController(text: player),
+       chartUrlController = TextEditingController(text: chartUrl);
 
   final String id;
+  final bool isPreset;
   final TextEditingController instrumentController;
   final TextEditingController playerController;
+  final TextEditingController chartUrlController;
 
   void dispose() {
     instrumentController.dispose();
     playerController.dispose();
+    chartUrlController.dispose();
+  }
+}
+
+class _EditSongPage extends StatefulWidget {
+  const _EditSongPage({required this.song});
+
+  final Song song;
+
+  @override
+  State<_EditSongPage> createState() => _EditSongPageState();
+}
+
+class _EditSongPageState extends State<_EditSongPage> {
+  late final TextEditingController _notesController;
+  late final List<_RoleDraft> _roleDrafts;
+
+  @override
+  void initState() {
+    super.initState();
+    _notesController = TextEditingController(text: widget.song.notes);
+    _roleDrafts = _buildPresetEditSongRoleDrafts(widget.song.roles);
+  }
+
+  @override
+  void dispose() {
+    _notesController.dispose();
+    for (final _RoleDraft roleDraft in _roleDrafts) {
+      roleDraft.dispose();
+    }
+    super.dispose();
+  }
+
+  void _addRoleDraft() {
+    setState(() {
+      _roleDrafts.add(_RoleDraft(id: _createId('role')));
+    });
+  }
+
+  void _removeRoleDraft(_RoleDraft roleDraft) {
+    if (roleDraft.isPreset) {
+      return;
+    }
+    setState(() {
+      _roleDrafts.remove(roleDraft);
+      roleDraft.dispose();
+    });
+  }
+
+  void _save() {
+    final String title = widget.song.title.trim();
+    final String artist = widget.song.artist.trim();
+    if (title.isEmpty || artist.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Song title and artist are required.')),
+      );
+      return;
+    }
+
+    final List<RoleAssignment> roles = <RoleAssignment>[];
+    for (final _RoleDraft roleDraft in _roleDrafts) {
+      final String instrument = roleDraft.instrumentController.text.trim();
+      final String player = roleDraft.playerController.text.trim();
+      final String chartUrl = roleDraft.chartUrlController.text.trim();
+      if (instrument.isEmpty && player.isEmpty && chartUrl.isEmpty) {
+        continue;
+      }
+      if (instrument.isEmpty || player.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Each role needs both instrument and player.'),
+          ),
+        );
+        return;
+      }
+      roles.add(
+        RoleAssignment(
+          id: roleDraft.id,
+          instrument: instrument,
+          player: player,
+          chartUrl: chartUrl,
+        ),
+      );
+    }
+
+    final Song editedSong = Song(
+      id: widget.song.id,
+      title: title,
+      artist: artist,
+      duration: widget.song.duration.trim(),
+      key: widget.song.key,
+      bpm: widget.song.bpm,
+      spotifyUrl: widget.song.spotifyUrl,
+      modifier: widget.song.modifier,
+      notes: _notesController.text.trim(),
+      artworkUrl: widget.song.artworkUrl,
+      roles: roles,
+      spotifyTrackId: widget.song.spotifyTrackId,
+      spotifyUri: widget.song.spotifyUri,
+      sourceType: widget.song.sourceType,
+      sourceImportedAt: widget.song.sourceImportedAt,
+    );
+    Navigator.of(context).pop(editedSong);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: RadialGradient(
+            center: Alignment.topCenter,
+            radius: 1.1,
+            colors: <Color>[
+              Color(0x883F1A63),
+              Color(0xFF151126),
+              _appBackground,
+            ],
+          ),
+        ),
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Row(
+                  children: <Widget>[
+                    IconButton(
+                      onPressed: () => Navigator.of(context).maybePop(),
+                      icon: const Icon(Icons.arrow_back_rounded),
+                      tooltip: 'Back',
+                    ),
+                    const SizedBox(width: 2),
+                    const Expanded(child: _PageTitleHeading(text: 'Edit song')),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                _SectionCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      _ReadOnlySongDetailTile(
+                        label: 'Song title',
+                        value: widget.song.title.trim().isEmpty
+                            ? 'Untitled song'
+                            : widget.song.title.trim(),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: _ReadOnlySongDetailTile(
+                              label: 'Artist',
+                              value: widget.song.artist.trim().isEmpty
+                                  ? 'Unknown artist'
+                                  : widget.song.artist.trim(),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: _ReadOnlySongDetailTile(
+                              label: 'Duration',
+                              value: widget.song.duration.trim().isEmpty
+                                  ? 'Unknown'
+                                  : widget.song.duration.trim(),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _notesController,
+                        maxLines: 3,
+                        decoration: const InputDecoration(
+                          labelText: 'Notes',
+                          alignLabelWithHint: true,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _SectionCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      Row(
+                        children: <Widget>[
+                          const _SectionLabel(text: 'Instrument roles'),
+                          const Spacer(),
+                          TextButton.icon(
+                            onPressed: _addRoleDraft,
+                            icon: const Icon(Icons.add),
+                            label: const Text('Add role'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      ..._roleDrafts.map((_RoleDraft roleDraft) {
+                        final String instrumentValue = roleDraft
+                            .instrumentController
+                            .text
+                            .trim();
+                        final String playerValue = roleDraft
+                            .playerController
+                            .text
+                            .trim();
+                        final String? selectedInstrument =
+                            _editableInstrumentOptions.contains(instrumentValue)
+                            ? instrumentValue
+                            : null;
+                        final String? selectedPlayer =
+                            _editablePlayerOptions.contains(playerValue)
+                            ? playerValue
+                            : null;
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: <Widget>[
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  if (roleDraft.isPreset)
+                                    SizedBox(
+                                      width: 96,
+                                      child: _RoleInstrumentLabel(
+                                        instrument: instrumentValue,
+                                      ),
+                                    )
+                                  else
+                                    Expanded(
+                                      flex: 2,
+                                      child: DropdownButtonFormField<String>(
+                                        isExpanded: true,
+                                        initialValue: selectedInstrument,
+                                        hint: const Text('Instrument'),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Instrument',
+                                          isDense: true,
+                                        ),
+                                        items: _editableInstrumentOptions
+                                            .map((String option) {
+                                              return DropdownMenuItem<String>(
+                                                value: option,
+                                                child: Text(
+                                                  option,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                ),
+                                              );
+                                            })
+                                            .toList(growable: false),
+                                        onChanged: (String? value) {
+                                          setState(() {
+                                            roleDraft
+                                                    .instrumentController
+                                                    .text =
+                                                value ?? '';
+                                          });
+                                        },
+                                      ),
+                                    ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    flex: 3,
+                                    child: DropdownButtonFormField<String>(
+                                      isExpanded: true,
+                                      initialValue: selectedPlayer,
+                                      hint: const Text('Select player'),
+                                      decoration: const InputDecoration(
+                                        labelText: 'Player',
+                                        isDense: true,
+                                      ),
+                                      items: _editablePlayerOptions
+                                          .map((String option) {
+                                            return DropdownMenuItem<String>(
+                                              value: option,
+                                              child: Text(
+                                                option,
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            );
+                                          })
+                                          .toList(growable: false),
+                                      onChanged: (String? value) {
+                                        setState(() {
+                                          roleDraft.playerController.text =
+                                              value ?? '';
+                                        });
+                                      },
+                                    ),
+                                  ),
+                                  if (!roleDraft.isPreset)
+                                    IconButton(
+                                      onPressed: () =>
+                                          _removeRoleDraft(roleDraft),
+                                      icon: const Icon(
+                                        Icons.delete_outline_rounded,
+                                      ),
+                                      tooltip: 'Remove role',
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              TextField(
+                                controller: roleDraft.chartUrlController,
+                                decoration: const InputDecoration(
+                                  labelText: 'Chords/Tab link (optional)',
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: _save,
+                  icon: const Icon(Icons.check_rounded),
+                  label: const Text('Save changes'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _appPrimary,
+                    foregroundColor: const Color(0xFF131313),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -1909,6 +3468,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
   final TextEditingController _durationController = TextEditingController();
   final TextEditingController _keyController = TextEditingController();
   final TextEditingController _bpmController = TextEditingController();
+  final TextEditingController _modifierController = TextEditingController();
   final TextEditingController _notesController = TextEditingController();
 
   final List<_RoleDraft> _roleDrafts = <_RoleDraft>[
@@ -1946,6 +3506,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     _durationController.dispose();
     _keyController.dispose();
     _bpmController.dispose();
+    _modifierController.dispose();
     _notesController.dispose();
     for (final _RoleDraft roleDraft in _roleDrafts) {
       roleDraft.dispose();
@@ -1969,16 +3530,52 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     });
   }
 
-
   Uri _backendUri(
     String path, {
     Map<String, String> queryParameters = const <String, String>{},
   }) {
-    return Uri.parse('$_spotifyBackendBaseUrl$path').replace(
-      queryParameters: queryParameters,
-    );
+    return Uri.parse(
+      '$_spotifyBackendBaseUrl$path',
+    ).replace(queryParameters: queryParameters);
   }
 
+  List<Map<String, dynamic>> _extractTrackPayloadsFromAccountPayload(
+    Map<String, dynamic>? payload,
+  ) {
+    final List<Map<String, dynamic>> trackPayloads = <Map<String, dynamic>>[];
+
+    void appendTrackEntries(Object? rawEntries) {
+      if (rawEntries is! List) {
+        return;
+      }
+      for (final Object? rawEntry in rawEntries) {
+        final Map<String, dynamic>? entry = _asStringKeyedMap(rawEntry);
+        if (entry == null) {
+          continue;
+        }
+        trackPayloads.add(entry);
+      }
+    }
+
+    appendTrackEntries(payload?['tracks']);
+    appendTrackEntries(payload?['items']);
+
+    final Map<String, dynamic>? tracksMap = _asStringKeyedMap(
+      payload?['tracks'],
+    );
+    appendTrackEntries(tracksMap?['items']);
+
+    final Map<String, dynamic>? dataMap = _asStringKeyedMap(payload?['data']);
+    appendTrackEntries(dataMap?['tracks']);
+    appendTrackEntries(dataMap?['items']);
+
+    final Map<String, dynamic>? dataTracksMap = _asStringKeyedMap(
+      dataMap?['tracks'],
+    );
+    appendTrackEntries(dataTracksMap?['items']);
+
+    return trackPayloads;
+  }
 
   Future<List<_SpotifyImportTrack>> _importFromAccountEndpoint(
     String path, {
@@ -1993,22 +3590,33 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       headers: <String, String>{'Accept': 'application/json'},
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw const FormatException('Spotify account import failed');
+      throw FormatException(
+        _spotifyBackendFailureMessage(
+          null,
+          response: response,
+          fallback: 'Spotify account import failed',
+        ),
+      );
     }
-    final Map<String, dynamic>? payload = _asStringKeyedMap(
-      jsonDecode(response.body),
-    );
-    final Object? rawTracks = payload?['tracks'];
-    if (rawTracks is! List) {
+    final Object? decoded = jsonDecode(response.body);
+    final Map<String, dynamic>? payload = _asStringKeyedMap(decoded);
+    final List<Map<String, dynamic>> trackPayloads =
+        _extractTrackPayloadsFromAccountPayload(payload);
+    if (trackPayloads.isEmpty && decoded is List) {
+      for (final Object? rawEntry in decoded) {
+        final Map<String, dynamic>? entry = _asStringKeyedMap(rawEntry);
+        if (entry == null) {
+          continue;
+        }
+        trackPayloads.add(entry);
+      }
+    }
+    if (trackPayloads.isEmpty) {
       throw const FormatException('Track payload missing');
     }
 
     final List<_SpotifyImportTrack> tracks = <_SpotifyImportTrack>[];
-    for (final Object? rawTrack in rawTracks) {
-      final Map<String, dynamic>? trackMap = _asStringKeyedMap(rawTrack);
-      if (trackMap == null) {
-        continue;
-      }
+    for (final Map<String, dynamic> trackMap in trackPayloads) {
       final _SpotifyImportTrack parsed = _SpotifyImportTrack.fromJson(trackMap);
       if (parsed.spotifyTrackId.isEmpty ||
           parsed.title.isEmpty ||
@@ -2023,6 +3631,38 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     return tracks;
   }
 
+  Future<List<_SpotifyImportTrack>> _importPlaylistTracksById(
+    String playlistId,
+  ) async {
+    final String trimmedPlaylistId = playlistId.trim();
+    if (trimmedPlaylistId.isEmpty) {
+      throw const FormatException('Playlist id missing');
+    }
+
+    final List<Map<String, String>> queryVariants = <Map<String, String>>[
+      <String, String>{'playlistId': trimmedPlaylistId},
+      <String, String>{'playlist_id': trimmedPlaylistId},
+      <String, String>{'id': trimmedPlaylistId},
+    ];
+
+    Object? lastError;
+    for (final Map<String, String> query in queryVariants) {
+      try {
+        return await _importFromAccountEndpoint(
+          '/spotify/me/playlist-tracks',
+          queryParameters: query,
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError != null) {
+      throw lastError;
+    }
+    throw const FormatException('Playlist import failed');
+  }
+
   Future<List<_SpotifyPlaylistSummary>> _fetchAccountPlaylists() async {
     final http.Response response = await http.get(
       _backendUri(
@@ -2034,24 +3674,48 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       headers: <String, String>{'Accept': 'application/json'},
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw const FormatException('Failed to fetch playlists');
+      throw FormatException(
+        _spotifyBackendFailureMessage(
+          null,
+          response: response,
+          fallback: 'Failed to fetch playlists',
+        ),
+      );
     }
-    final Map<String, dynamic>? payload = _asStringKeyedMap(
-      jsonDecode(response.body),
+    final Object? decoded = jsonDecode(response.body);
+    final Map<String, dynamic>? payload = _asStringKeyedMap(decoded);
+    final List<Object?> rawPlaylistEntries = <Object?>[];
+
+    void appendPlaylistEntries(Object? rawEntries) {
+      if (rawEntries is! List) {
+        return;
+      }
+      rawPlaylistEntries.addAll(rawEntries);
+    }
+
+    if (decoded is List) {
+      rawPlaylistEntries.addAll(decoded);
+    }
+    appendPlaylistEntries(payload?['playlists']);
+    appendPlaylistEntries(payload?['items']);
+    final Map<String, dynamic>? playlistsMap = _asStringKeyedMap(
+      payload?['playlists'],
     );
-    final Object? rawPlaylists = payload?['playlists'];
-    if (rawPlaylists is! List) {
-      throw const FormatException('Playlists payload missing');
+    appendPlaylistEntries(playlistsMap?['items']);
+
+    if (rawPlaylistEntries.isEmpty) {
+      return <_SpotifyPlaylistSummary>[];
     }
 
     final List<_SpotifyPlaylistSummary> playlists = <_SpotifyPlaylistSummary>[];
-    for (final Object? rawPlaylist in rawPlaylists) {
+    for (final Object? rawPlaylist in rawPlaylistEntries) {
       final Map<String, dynamic>? playlistMap = _asStringKeyedMap(rawPlaylist);
       if (playlistMap == null) {
         continue;
       }
-      final _SpotifyPlaylistSummary playlist =
-          _SpotifyPlaylistSummary.fromJson(playlistMap);
+      final _SpotifyPlaylistSummary playlist = _SpotifyPlaylistSummary.fromJson(
+        playlistMap,
+      );
       if (playlist.id.isEmpty || playlist.name.isEmpty) {
         continue;
       }
@@ -2081,6 +3745,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
           '$sourceLabel import complete: ${mergeResult.addedCount} added, ${mergeResult.updatedCount} updated.';
     });
   }
+
   Future<List<_SpotifyImportTrack>?> _showTrackSelectionSheet({
     required String title,
     required List<_SpotifyImportTrack> tracks,
@@ -2157,7 +3822,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                             : ListView.builder(
                                 itemCount: tracks.length,
                                 itemBuilder: (BuildContext context, int index) {
-                                  final _SpotifyImportTrack track = tracks[index];
+                                  final _SpotifyImportTrack track =
+                                      tracks[index];
                                   final bool isSelected = selectedIndexes
                                       .contains(index);
                                   final String durationLabel =
@@ -2197,11 +3863,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                             : () {
                                 final List<_SpotifyImportTrack> selectedTracks =
                                     <_SpotifyImportTrack>[
-                                      for (
-                                        int i = 0;
-                                        i < tracks.length;
-                                        i += 1
-                                      )
+                                      for (int i = 0; i < tracks.length; i += 1)
                                         if (selectedIndexes.contains(i))
                                           tracks[i],
                                     ];
@@ -2368,22 +4030,24 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         _importState = _ImportState.loading;
         _statusMessage = 'Loading songs from ${selectedPlaylist.name}...';
       });
-      final List<_SpotifyImportTrack> tracks = await _importFromAccountEndpoint(
-        '/spotify/me/playlist-tracks',
-        queryParameters: <String, String>{'playlistId': selectedPlaylist.id},
+      final List<_SpotifyImportTrack> tracks = await _importPlaylistTracksById(
+        selectedPlaylist.id,
       );
       await _selectTracksAndImport(
         selectionTitle: 'Select songs from ${selectedPlaylist.name}',
         sourceLabel: selectedPlaylist.name,
         tracks: tracks,
       );
-    } catch (_) {
+    } catch (error) {
       if (!mounted) {
         return;
       }
       setState(() {
         _importState = _ImportState.error;
-        _statusMessage = 'Could not import from your playlists.';
+        _statusMessage = _spotifyBackendFailureMessage(
+          error,
+          fallback: 'Could not import from your playlists.',
+        );
       });
     }
   }
@@ -2443,6 +4107,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       key: '',
       bpm: '',
       spotifyUrl: track.spotifyUrl,
+      modifier: '',
       notes: '',
       artworkUrl: track.artworkUrl,
       roles: const <RoleAssignment>[],
@@ -2475,9 +4140,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         _statusMessage = 'Importing playlist from Spotify...';
       });
       try {
-        final List<_SpotifyImportTrack> importedTracks = await _importFromBackend(
-          spotifyUri,
-        );
+        final List<_SpotifyImportTrack> importedTracks =
+            await _importFromBackend(spotifyUri);
         final List<Song> songs = importedTracks
             .map(
               (_SpotifyImportTrack track) => _songFromImportedTrack(
@@ -2584,6 +4248,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     _durationController.clear();
     _keyController.clear();
     _bpmController.clear();
+    _modifierController.clear();
     _notesController.clear();
     for (final _RoleDraft roleDraft in _roleDrafts) {
       roleDraft.dispose();
@@ -2620,6 +4285,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
             id: _createId('role'),
             instrument: instrument,
             player: player,
+            chartUrl: roleDraft.chartUrlController.text.trim(),
           );
         })
         .whereType<RoleAssignment>()
@@ -2642,6 +4308,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       key: _keyController.text.trim(),
       bpm: _bpmController.text.trim(),
       spotifyUrl: spotifyUrl,
+      modifier: _modifierController.text.trim(),
       notes: _notesController.text.trim(),
       artworkUrl: _artworkUrl,
       roles: roles,
@@ -2696,39 +4363,90 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     );
   }
 
+  Widget _buildImportMethodButton({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    required VoidCallback onPressed,
+    bool highlighted = false,
+  }) {
+    final Color backgroundColor = highlighted
+        ? _appPrimary
+        : _appSurfaceStrong.withValues(alpha: 0.94);
+    final Color foregroundColor = highlighted
+        ? const Color(0xFF111111)
+        : Colors.white;
+    final Color subtitleColor = highlighted
+        ? const Color(0xFF3D3D3D)
+        : _appMutedText;
+    final String subtitleText = (subtitle ?? '').trim();
+
+    return FilledButton(
+      onPressed: onPressed,
+      style: FilledButton.styleFrom(
+        backgroundColor: backgroundColor,
+        foregroundColor: foregroundColor,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 19),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (subtitleText.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitleText,
+                    style: TextStyle(fontSize: 12, color: subtitleColor),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const Icon(Icons.chevron_right_rounded, size: 20),
+        ],
+      ),
+    );
+  }
+
   Widget _buildChooseStep(Color statusColor) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
+        const _PageTitleHeading(text: 'How do you want to add a song?'),
+        const SizedBox(height: 12),
         _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              const _SectionLabel(text: 'Choose import method'),
-              const SizedBox(height: 10),
-              FilledButton.icon(
+              _buildImportMethodButton(
                 onPressed: () => _setImporterStep(_ImporterStep.link),
-                icon: const Icon(Icons.link_rounded),
-                label: const Text('Import with Spotify link'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: _appPrimary,
-                  foregroundColor: const Color(0xFF131313),
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                ),
+                icon: Icons.link_rounded,
+                title: 'Spotify link',
+                highlighted: true,
               ),
               const SizedBox(height: 10),
-              FilledButton.tonalIcon(
+              _buildImportMethodButton(
                 onPressed: () => _setImporterStep(_ImporterStep.account),
-                icon: const Icon(Icons.account_circle_rounded),
-                label: const Text('Import from connected Spotify account'),
-                style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                ),
+                icon: Icons.account_circle_rounded,
+                title: 'Spotify account',
               ),
               if (!widget.spotifyAccountConnected) ...<Widget>[
                 const SizedBox(height: 8),
                 const Text(
-                  'Connect Spotify from the top bar to use playlist, liked songs, and recently played imports.',
+                  'Connect Spotify in the top bar to unlock account imports.',
                   style: TextStyle(color: _appMutedText, fontSize: 12),
                 ),
               ],
@@ -2747,16 +4465,17 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       children: <Widget>[
         _buildStepBackButton(_ImporterStep.choose),
         const SizedBox(height: 4),
+        const _PageTitleHeading(text: 'Import with Spotify link'),
+        const SizedBox(height: 12),
         _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              const _SectionLabel(text: 'Import with link'),
-              const SizedBox(height: 10),
               TextField(
                 controller: _spotifyUrlController,
                 decoration: const InputDecoration(
-                  hintText: 'https://open.spotify.com/track/... (or playlist/...)',
+                  hintText:
+                      'https://open.spotify.com/track/... (or playlist/...)',
                 ),
               ),
               const SizedBox(height: 10),
@@ -2776,7 +4495,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
                   label: Text(
                     _importState == _ImportState.loading
                         ? 'Importing...'
-                        : 'Import from Spotify link',
+                        : 'Import link',
                   ),
                   style: FilledButton.styleFrom(
                     backgroundColor: _appPrimary,
@@ -2827,14 +4546,16 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       children: <Widget>[
         _buildStepBackButton(_ImporterStep.choose),
         const SizedBox(height: 4),
+        const _PageTitleHeading(text: 'Import from Spotify account'),
+        const SizedBox(height: 12),
         _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              const _SectionLabel(text: 'Spotify account imports'),
-              const SizedBox(height: 10),
               FilledButton.tonalIcon(
-                onPressed: accountImportDisabled ? null : _importFromMyPlaylists,
+                onPressed: accountImportDisabled
+                    ? null
+                    : _importFromMyPlaylists,
                 icon: const Icon(Icons.queue_music_rounded),
                 label: const Text('My Playlists'),
               ),
@@ -2853,7 +4574,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
               if (!widget.spotifyAccountConnected) ...<Widget>[
                 const SizedBox(height: 8),
                 const Text(
-                  'Spotify account imports are disabled until Spotify is connected.',
+                  'Account imports are disabled until Spotify is connected.',
                   style: TextStyle(color: _appMutedText, fontSize: 12),
                 ),
               ],
@@ -2872,6 +4593,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
       children: <Widget>[
         _buildStepBackButton(_ImporterStep.link),
         const SizedBox(height: 4),
+        const _PageTitleHeading(text: 'Song details'),
+        const SizedBox(height: 12),
         if (_artworkUrl != null) ...<Widget>[
           _SectionCard(
             child: Row(
@@ -2953,6 +4676,13 @@ class _SongImporterPageState extends State<_SongImporterPage> {
               ),
               const SizedBox(height: 8),
               TextField(
+                controller: _modifierController,
+                decoration: const InputDecoration(
+                  labelText: 'Modifier (e.g. Capo 2, Drop D, Acoustic)',
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
                 controller: _notesController,
                 maxLines: 3,
                 decoration: const InputDecoration(
@@ -2983,28 +4713,42 @@ class _SongImporterPageState extends State<_SongImporterPage> {
               ..._roleDrafts.map((_RoleDraft roleDraft) {
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
-                      Expanded(
-                        child: TextField(
-                          controller: roleDraft.instrumentController,
-                          decoration: const InputDecoration(
-                            labelText: 'Instrument',
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: TextField(
+                              controller: roleDraft.instrumentController,
+                              decoration: const InputDecoration(
+                                labelText: 'Instrument',
+                              ),
+                            ),
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: roleDraft.playerController,
-                          decoration: const InputDecoration(
-                            labelText: 'Player',
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: TextField(
+                              controller: roleDraft.playerController,
+                              decoration: const InputDecoration(
+                                labelText: 'Player',
+                              ),
+                            ),
                           ),
-                        ),
+                          IconButton(
+                            onPressed: () => _removeRoleDraft(roleDraft),
+                            icon: const Icon(Icons.delete_outline_rounded),
+                          ),
+                        ],
                       ),
-                      IconButton(
-                        onPressed: () => _removeRoleDraft(roleDraft),
-                        icon: const Icon(Icons.delete_outline_rounded),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: roleDraft.chartUrlController,
+                        decoration: const InputDecoration(
+                          labelText: 'Chords/Tab link (optional)',
+                          hintText:
+                              'https://www.ultimate-guitar.com/... or any chart link',
+                        ),
                       ),
                     ],
                   ),
@@ -3017,7 +4761,7 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         FilledButton.icon(
           onPressed: _createSong,
           icon: const Icon(Icons.library_add_rounded),
-          label: const Text('Add song to setlist'),
+          label: const Text('Save song'),
           style: FilledButton.styleFrom(
             backgroundColor: _appPrimary,
             foregroundColor: const Color(0xFF131313),
@@ -3164,7 +4908,9 @@ class _ProfileAvatar extends StatelessWidget {
       radius: 20,
       backgroundColor: _appSurfaceStrong,
       backgroundImage: const NetworkImage(_fallbackAvatarUrl),
-      foregroundImage: resolvedImageUrl.isEmpty ? null : NetworkImage(resolvedImageUrl),
+      foregroundImage: resolvedImageUrl.isEmpty
+          ? null
+          : NetworkImage(resolvedImageUrl),
       child: resolvedImageUrl.isEmpty
           ? const Icon(Icons.person_rounded, color: Colors.white)
           : null,
@@ -3172,156 +4918,274 @@ class _ProfileAvatar extends StatelessWidget {
   }
 }
 
-class _SpotifyMiniPlayerBar extends StatelessWidget {
-  const _SpotifyMiniPlayerBar({
+class _CurrentSongBarFramePainter extends CustomPainter {
+  const _CurrentSongBarFramePainter({
+    required this.tabLeft,
+    required this.tabRight,
+    required this.cornerRadius,
+    required this.strokeWidth,
+    required this.color,
+  });
+
+  final double tabLeft;
+  final double tabRight;
+  final double cornerRadius;
+  final double strokeWidth;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double inset = strokeWidth / 2;
+    final double radius = cornerRadius;
+    final double width = size.width;
+    final double height = size.height;
+
+    final Paint paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeJoin = StrokeJoin.miter;
+
+    final Path path = Path()
+      ..moveTo(inset, inset + radius)
+      ..arcToPoint(
+        Offset(inset + radius, inset),
+        radius: Radius.circular(radius),
+        clockwise: true,
+      )
+      ..lineTo(width - inset - radius, inset)
+      ..arcToPoint(
+        Offset(width - inset, inset + radius),
+        radius: Radius.circular(radius),
+        clockwise: true,
+      )
+      ..lineTo(width - inset, height - inset)
+      ..lineTo(tabRight - strokeWidth, height - inset)
+      ..moveTo(tabLeft + strokeWidth, height - inset)
+      ..lineTo(inset + radius, height - inset)
+      ..arcToPoint(
+        Offset(inset, height - inset - radius),
+        radius: Radius.circular(radius),
+        clockwise: true,
+      )
+      ..lineTo(inset, inset + radius);
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CurrentSongBarFramePainter oldDelegate) {
+    return tabLeft != oldDelegate.tabLeft ||
+        tabRight != oldDelegate.tabRight ||
+        cornerRadius != oldDelegate.cornerRadius ||
+        strokeWidth != oldDelegate.strokeWidth ||
+        color != oldDelegate.color;
+  }
+}
+
+class _CurrentSongBar extends StatelessWidget {
+  const _CurrentSongBar({
+    required this.song,
     required this.playerState,
     required this.isConnecting,
     required this.errorMessage,
-    required this.onPlayPausePressed,
-    required this.onPreviousPressed,
-    required this.onNextPressed,
+    required this.onPressed,
   });
+  final Song song;
 
   final PlayerState? playerState;
   final bool isConnecting;
   final String? errorMessage;
-  final Future<void> Function() onPlayPausePressed;
-  final Future<void> Function() onPreviousPressed;
-  final Future<void> Function() onNextPressed;
+  final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
     final Track? track = playerState?.track;
-    final String title = (track?.name ?? '').trim();
-    final String artistName = (track?.artist.name ?? '').trim();
-    final bool isPaused = playerState?.isPaused ?? true;
-    final String? artworkUrl = _spotifyImageUriToUrl(track?.imageUri.raw);
-    return Container(
-      margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
-      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF121212),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Row(
+    final String title = song.title.trim().isEmpty
+        ? 'Untitled song'
+        : song.title.trim();
+    final String artistName = song.artist.trim().isEmpty
+        ? 'Unknown artist'
+        : song.artist.trim();
+    final String? spotifyArtworkUrl = _spotifyImageUriToUrl(
+      track?.imageUri.raw,
+    );
+    final String artworkFallback = (song.artworkUrl ?? '').trim();
+    final String? artworkUrl =
+        spotifyArtworkUrl ?? (artworkFallback.isEmpty ? null : artworkFallback);
+    final String playbackError = (errorMessage ?? '').trim();
+    final bool hasPlaybackError = playbackError.isNotEmpty;
+    final bool isPlaying = !(playerState?.isPaused ?? true);
+    final String? statusSuffix = hasPlaybackError
+        ? 'Playback issue'
+        : isConnecting
+        ? 'Connecting Spotify'
+        : isPlaying
+        ? 'Spotify playing'
+        : null;
+    final String subtitle = statusSuffix == null
+        ? artistName
+        : '$artistName • $statusSuffix';
+    final IconData statusIcon = hasPlaybackError
+        ? Icons.warning_amber_rounded
+        : isConnecting
+        ? Icons.sync_rounded
+        : isPlaying
+        ? Icons.graphic_eq_rounded
+        : Icons.music_note_rounded;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      child: LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          final double barWidth = constraints.maxWidth;
+          final double tabContentWidth =
+              barWidth - _bottomNavHorizontalPadding;
+          final double tabWidth = tabContentWidth / _bottomNavTabCount;
+          // Outer edges of the "Current Song" tab (rightmost tab) in the
+          // action bar below; the tab's right edge is flush with the bar.
+          final double tabLeft =
+              _bottomNavHorizontalPadding +
+              (tabWidth * (_bottomNavTabCount - 1));
+          final double tabRight = barWidth;
+          const double barCornerRadius = 18;
+
+          return Stack(
             children: <Widget>[
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: artworkUrl == null
-                    ? Container(
-                        width: 48,
-                        height: 48,
-                        color: _appSurfaceStrong,
-                        alignment: Alignment.center,
-                        child: const Icon(
-                          Icons.music_note_rounded,
-                          color: _appMutedText,
-                        ),
-                      )
-                    : Image.network(
-                        artworkUrl,
-                        width: 48,
-                        height: 48,
-                        fit: BoxFit.cover,
-                        errorBuilder: (
-                          BuildContext context,
-                          Object error,
-                          StackTrace? stackTrace,
-                        ) {
-                          return Container(
-                            width: 48,
-                            height: 48,
-                            color: _appSurfaceStrong,
-                            alignment: Alignment.center,
-                            child: const Icon(
-                              Icons.music_note_rounded,
-                              color: _appMutedText,
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: onPressed,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(barCornerRadius),
+                    topRight: Radius.circular(barCornerRadius),
+                    bottomLeft: Radius.circular(barCornerRadius),
+                  ),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(10, 9, 12, 9),
+                    decoration: BoxDecoration(
+                      color: _appSurfaceStrong.withValues(alpha: 0.96),
+                      borderRadius: const BorderRadius.only(
+                        topLeft: Radius.circular(barCornerRadius),
+                        topRight: Radius.circular(barCornerRadius),
+                        bottomLeft: Radius.circular(barCornerRadius),
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(10),
+                              child: artworkUrl == null
+                                  ? Container(
+                                      width: 44,
+                                      height: 44,
+                                      color: _appSurface.withValues(
+                                        alpha: 0.65,
+                                      ),
+                                      alignment: Alignment.center,
+                                      child: Icon(
+                                        statusIcon,
+                                        color: _appPrimary,
+                                      ),
+                                    )
+                                  : Image.network(
+                                      artworkUrl,
+                                      width: 44,
+                                      height: 44,
+                                      fit: BoxFit.cover,
+                                      errorBuilder:
+                                          (
+                                            BuildContext context,
+                                            Object error,
+                                            StackTrace? stackTrace,
+                                          ) {
+                                            return Container(
+                                              width: 44,
+                                              height: 44,
+                                              color: _appSurface.withValues(
+                                                alpha: 0.65,
+                                              ),
+                                              alignment: Alignment.center,
+                                              child: Icon(
+                                                statusIcon,
+                                                color: _appPrimary,
+                                              ),
+                                            );
+                                          },
+                                    ),
                             ),
-                          );
-                        },
-                      ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      title.isEmpty ? 'No song playing' : title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: Colors.white,
-                      ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 1),
+                                  Text(
+                                    subtitle,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: _appMutedText.withValues(
+                                        alpha: 0.95,
+                                      ),
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (hasPlaybackError) ...<Widget>[
+                          const SizedBox(height: 4),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              playbackError,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xFF7A1D1D),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      artistName.isEmpty ? 'Spotify mini player' : artistName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: _appMutedText, fontSize: 12),
-                    ),
-                  ],
+                  ),
                 ),
               ),
-              IconButton(
-                onPressed: isConnecting
-                    ? null
-                    : () {
-                        unawaited(onPreviousPressed());
-                      },
-                icon: const Icon(Icons.skip_previous_rounded),
-                tooltip: 'Previous',
-              ),
-              IconButton(
-                onPressed: isConnecting
-                    ? null
-                    : () {
-                        unawaited(onPlayPausePressed());
-                      },
-                icon: isConnecting
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(
-                        isPaused
-                            ? Icons.play_circle_fill_rounded
-                            : Icons.pause_circle_filled_rounded,
-                      ),
-                tooltip: isPaused ? 'Play' : 'Pause',
-              ),
-              IconButton(
-                onPressed: isConnecting
-                    ? null
-                    : () {
-                        unawaited(onNextPressed());
-                      },
-                icon: const Icon(Icons.skip_next_rounded),
-                tooltip: 'Next',
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: CustomPaint(
+                    painter: _CurrentSongBarFramePainter(
+                      tabLeft: tabLeft,
+                      tabRight: tabRight,
+                      cornerRadius: barCornerRadius,
+                      strokeWidth: _connectedOutlineWidth,
+                      color: _appPrimary,
+                    ),
+                  ),
+                ),
               ),
             ],
-          ),
-          if ((errorMessage ?? '').trim().isNotEmpty) ...<Widget>[
-            const SizedBox(height: 4),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                errorMessage!.trim(),
-                style: const TextStyle(
-                  color: Color(0xFFFF9A9A),
-                  fontSize: 11,
-                ),
-              ),
-            ),
-          ],
-        ],
+          );
+        },
       ),
     );
   }
@@ -3331,51 +5195,71 @@ class _BottomActionBar extends StatelessWidget {
   const _BottomActionBar({
     required this.activeIndex,
     required this.onActionPressed,
+    this.margin = const EdgeInsets.fromLTRB(14, 8, 14, 12),
+    this.showCurrentSongConnector = false,
+    this.highlightCurrentSongAction = false,
   });
 
   final int activeIndex;
   final ValueChanged<int> onActionPressed;
+  final EdgeInsets margin;
+  final bool showCurrentSongConnector;
+  final bool highlightCurrentSongAction;
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      top: false,
-      child: Container(
-        margin: const EdgeInsets.fromLTRB(14, 8, 14, 12),
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-        decoration: BoxDecoration(
-          color: _appSurfaceStrong.withValues(alpha: 0.96),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-        ),
-        child: Row(
-          children: <Widget>[
-            Expanded(
-              child: _BottomActionButton(
-                label: 'Setlist',
-                icon: Icons.queue_music_rounded,
-                selected: activeIndex == 0,
-                onPressed: () => onActionPressed(0),
-              ),
+    final bool hasConnectedCurrentSongSection = showCurrentSongConnector;
+    return Container(
+      margin: margin,
+      padding: EdgeInsets.fromLTRB(
+        _bottomNavHorizontalPadding,
+        hasConnectedCurrentSongSection ? 0 : 6,
+        hasConnectedCurrentSongSection ? 0 : _bottomNavHorizontalPadding,
+        6,
+      ),
+      decoration: BoxDecoration(
+        color: _appSurfaceStrong.withValues(alpha: 0.96),
+        borderRadius: hasConnectedCurrentSongSection
+            ? const BorderRadius.only(
+                bottomLeft: Radius.circular(_bottomNavOuterCornerRadius),
+                bottomRight: Radius.circular(_bottomNavOuterCornerRadius),
+              )
+            : BorderRadius.circular(_bottomNavOuterCornerRadius),
+        border: hasConnectedCurrentSongSection
+            ? null
+            : Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: _BottomActionButton(
+              label: 'Importer',
+              icon: Icons.playlist_add_rounded,
+              selected: activeIndex == 0,
+              topInset: hasConnectedCurrentSongSection ? 6 : 0,
+              onPressed: () => onActionPressed(0),
             ),
-            Expanded(
-              child: _BottomActionButton(
-                label: 'Importer',
-                icon: Icons.playlist_add_rounded,
-                selected: activeIndex == 1,
-                onPressed: () => onActionPressed(1),
-              ),
+          ),
+          Expanded(
+            child: _BottomActionButton(
+              label: 'Setlist',
+              icon: Icons.queue_music_rounded,
+              selected: activeIndex == 1,
+              topInset: hasConnectedCurrentSongSection ? 6 : 0,
+              onPressed: () => onActionPressed(1),
             ),
-            Expanded(
-              child: _BottomActionButton(
-                label: 'Current Song',
-                icon: Icons.equalizer_rounded,
-                selected: activeIndex == 2,
-                onPressed: () => onActionPressed(2),
-              ),
+          ),
+          Expanded(
+            child: _BottomActionButton(
+              label: 'Current Song',
+              icon: Icons.equalizer_rounded,
+              selected: activeIndex == 2,
+              highlighted: highlightCurrentSongAction,
+              connectedToBar: hasConnectedCurrentSongSection,
+              onPressed: () => onActionPressed(2),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -3386,34 +5270,108 @@ class _BottomActionButton extends StatelessWidget {
     required this.label,
     required this.icon,
     required this.selected,
+    this.highlighted = false,
+    this.connectedToBar = false,
+    this.topInset = 0,
     required this.onPressed,
   });
 
   final String label;
   final IconData icon;
   final bool selected;
+  final bool highlighted;
+  final bool connectedToBar;
+  final double topInset;
   final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    return TextButton(
-      onPressed: onPressed,
-      style: TextButton.styleFrom(
-        foregroundColor: selected ? Colors.black : _appMutedText,
-        backgroundColor: selected ? _appPrimary : Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        padding: const EdgeInsets.symmetric(vertical: 10),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Icon(icon, size: 20),
-          const SizedBox(height: 4),
-          Text(
-            label,
-            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+    final bool isSelected = selected;
+    final bool isHighlighted = highlighted && !selected;
+    final bool useConnectedBorder = connectedToBar && (highlighted || selected);
+    final BorderRadius borderRadius = connectedToBar
+        ? const BorderRadius.only(
+            bottomLeft: Radius.circular(12),
+            bottomRight: Radius.circular(_bottomNavOuterCornerRadius),
+          )
+        : BorderRadius.circular(12);
+    final BoxBorder? border = useConnectedBorder
+        ? const Border(
+            left: BorderSide(color: _appPrimary, width: _connectedOutlineWidth),
+            right: BorderSide(
+              color: _appPrimary,
+              width: _connectedOutlineWidth,
+            ),
+            bottom: BorderSide(
+              color: _appPrimary,
+              width: _connectedOutlineWidth,
+            ),
+          )
+        : isHighlighted
+        ? Border.all(color: _appPrimary, width: _connectedOutlineWidth)
+        : null;
+    final Color foregroundColor = isSelected
+        ? Colors.black
+        : (highlighted ? _appPrimary : _appMutedText);
+    final Color backgroundColor = isSelected ? _appPrimary : Colors.transparent;
+
+    // The connected tab has no outer top inset so its outline meets the
+    // current-song bar flush; the siblings' inset moves inside the tab
+    // instead, keeping icon and label aligned across all tabs.
+    final EdgeInsets contentPadding = connectedToBar
+        ? const EdgeInsets.only(top: 14, bottom: 7)
+        : const EdgeInsets.symmetric(vertical: 7);
+
+    return Padding(
+      padding: EdgeInsets.only(top: topInset),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: borderRadius,
+          child: Ink(
+            decoration: BoxDecoration(
+              color: backgroundColor,
+              borderRadius: borderRadius,
+              border: border,
+            ),
+            padding: contentPadding,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(icon, size: 18, color: foregroundColor),
+                const SizedBox(height: 3),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: foregroundColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PageTitleHeading extends StatelessWidget {
+  const _PageTitleHeading({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      style: const TextStyle(
+        color: Colors.white,
+        fontSize: 30,
+        fontWeight: FontWeight.w800,
+        height: 1.05,
       ),
     );
   }
@@ -3432,6 +5390,84 @@ class _SectionCard extends StatelessWidget {
   }
 }
 
+class _ReadOnlySongDetailTile extends StatelessWidget {
+  const _ReadOnlySongDetailTile({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+      decoration: BoxDecoration(
+        color: _appSurface.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            label,
+            style: const TextStyle(
+              color: _appMutedText,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RoleInstrumentLabel extends StatelessWidget {
+  const _RoleInstrumentLabel({required this.instrument});
+
+  final String instrument;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 56,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: _appSurface.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      alignment: Alignment.centerLeft,
+      child: Text(
+        instrument,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
 class _SectionLabel extends StatelessWidget {
   const _SectionLabel({required this.text});
 
@@ -3439,22 +5475,29 @@ class _SectionLabel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(
-        color: _appSurfaceStrong,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
-      child: Text(
-        text,
-        style: const TextStyle(
-          fontSize: 10,
-          color: _appMutedText,
-          letterSpacing: 1.0,
-          fontWeight: FontWeight.w700,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Text(
+          text.toUpperCase(),
+          style: const TextStyle(
+            fontSize: 11,
+            color: _appMutedText,
+            letterSpacing: 0.7,
+            fontWeight: FontWeight.w700,
+          ),
         ),
-      ),
+        const SizedBox(height: 4),
+        Container(
+          width: 34,
+          height: 2,
+          decoration: BoxDecoration(
+            color: _appPrimary.withValues(alpha: 0.85),
+            borderRadius: BorderRadius.circular(999),
+          ),
+        ),
+      ],
     );
   }
 }

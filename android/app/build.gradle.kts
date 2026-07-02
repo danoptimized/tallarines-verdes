@@ -48,3 +48,8 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    implementation(project(":spotify-app-remote"))
+    implementation("com.spotify.android:auth:2.1.0")
+}
