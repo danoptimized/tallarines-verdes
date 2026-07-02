@@ -129,6 +129,7 @@ const String _spotifySdkRedirectUri = String.fromEnvironment(
   defaultValue: '',
 );
 const String _spotifyAndroidAppRemoteRedirectUri = 'spotify-sdk://auth';
+const String _spotifyIosAppRemoteRedirectUri = 'tallarinesverdes://spotify-auth';
 const String _spotifyRemoteAuthScope =
     'app-remote-control,user-modify-playback-state,user-read-playback-state,user-read-currently-playing,streaming';
 
@@ -139,6 +140,9 @@ String _resolveSpotifySdkRedirectUri(String serverRedirectUri) {
   }
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     return _spotifyAndroidAppRemoteRedirectUri;
+  }
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+    return _spotifyIosAppRemoteRedirectUri;
   }
   return serverRedirectUri.trim();
 }
