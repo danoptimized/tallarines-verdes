@@ -1,5 +1,8 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 import cors from 'cors';
 import express from 'express';
@@ -8,6 +11,11 @@ import { getFirestore } from 'firebase-admin/firestore';
 
 const app = express();
 const port = Number(process.env.PORT || '8787');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const webBuildDir = path.resolve(__dirname, '..', 'build', 'web');
+const webIndexPath = path.join(webBuildDir, 'index.html');
+const hasWebBuild = fs.existsSync(webIndexPath);
 const rawBaseUrl = (process.env.BASE_URL || 'https://tv.lull.works').trim();
 const baseUrl = rawBaseUrl.endsWith('/')
   ? rawBaseUrl.substring(0, rawBaseUrl.length - 1)
@@ -794,6 +802,21 @@ if (apiPrefix) {
   app.use(apiPrefix, spotifyApi);
 } else {
   app.use(spotifyApi);
+}
+
+if (hasWebBuild) {
+  app.use(express.static(webBuildDir));
+  app.get('*', (req, res) => {
+    if (
+      apiPrefix &&
+      (req.path === apiPrefix || req.path.startsWith(`${apiPrefix}/`))
+    ) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    return res.sendFile(webIndexPath);
+  });
+} else {
+  console.warn(`Flutter web build not found at ${webIndexPath}; serving API only.`);
 }
 
 app.listen(port, () => {

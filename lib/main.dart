@@ -981,28 +981,12 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     ).replace(queryParameters: queryParameters);
   }
 
-  DocumentReference<Map<String, dynamic>>? get _setlistDoc {
-    final String? userId = _firebaseUserId;
-    if (userId == null) {
-      return null;
-    }
-    return _firestore
-        .collection('users')
-        .doc(userId)
-        .collection('setlists')
-        .doc('main');
-  }
-
   DocumentReference<Map<String, dynamic>> get _sharedSetlistDoc {
     return _firestore.collection('setlists').doc('live');
   }
 
-  CollectionReference<Map<String, dynamic>>? get _songsCollection {
-    final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
-    if (setlistDoc == null) {
-      return null;
-    }
-    return setlistDoc.collection('songs');
+  CollectionReference<Map<String, dynamic>> get _songsCollection {
+    return _sharedSetlistDoc.collection('songs');
   }
 
   String? get _resolvedCurrentSongId {
@@ -1106,17 +1090,9 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
 
       _firebaseUserId = user.uid;
       await _syncSpotifyConnectionStatus();
-      await _ensureCloudSetlistExists();
       await _ensureSharedSetlistExists();
       await _sharedSetlistSubscription?.cancel();
       await _songsSubscription?.cancel();
-
-      final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
-      final CollectionReference<Map<String, dynamic>>? songsCollection =
-          _songsCollection;
-      if (setlistDoc == null || songsCollection == null) {
-        throw const FormatException('Missing Firestore setlist references');
-      }
 
       _sharedSetlistSubscription = _sharedSetlistDoc.snapshots().listen((
         DocumentSnapshot<Map<String, dynamic>> snapshot,
@@ -1129,7 +1105,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         });
       });
 
-      _songsSubscription = songsCollection
+      _songsSubscription = _songsCollection
           .orderBy('position')
           .snapshots()
           .listen(
@@ -1720,21 +1696,6 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     }
   }
 
-  Future<void> _ensureCloudSetlistExists() async {
-    final DocumentReference<Map<String, dynamic>>? setlistDoc = _setlistDoc;
-    if (setlistDoc == null) {
-      return;
-    }
-    final DocumentSnapshot<Map<String, dynamic>> snapshot = await setlistDoc
-        .get();
-    if (snapshot.exists) {
-      return;
-    }
-    await setlistDoc.set(<String, dynamic>{
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
-  }
-
   Future<void> _ensureSharedSetlistExists() async {
     final DocumentSnapshot<Map<String, dynamic>> snapshot =
         await _sharedSetlistDoc.get();
@@ -1772,11 +1733,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   }
 
   Future<void> _replaceCloudSongs(List<Song> songs) async {
-    final CollectionReference<Map<String, dynamic>>? songsCollection =
+    final CollectionReference<Map<String, dynamic>> songsCollection =
         _songsCollection;
-    if (songsCollection == null) {
-      return;
-    }
 
     final QuerySnapshot<Map<String, dynamic>> existingSongsSnapshot =
         await songsCollection.get();

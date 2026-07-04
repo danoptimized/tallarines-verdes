@@ -1,9 +1,15 @@
 .git
 .dart_tool
-build
+build/*
+!build/web
+!build/web/**
 node_modules
 **/node_modules
 ios/Pods
 android/.gradle
 android/local.properties
+.env
+.env.*
+**/.env
+**/.env.*
 *.iml
