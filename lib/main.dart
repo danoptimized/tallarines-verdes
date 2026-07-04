@@ -985,8 +985,24 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
     return _firestore.collection('setlists').doc('live');
   }
 
+  DocumentReference<Map<String, dynamic>>? get _legacyUserSetlistDoc {
+    final String? userId = _firebaseUserId;
+    if (userId == null) {
+      return null;
+    }
+    return _firestore
+        .collection('users')
+        .doc(userId)
+        .collection('setlists')
+        .doc('main');
+  }
+
   CollectionReference<Map<String, dynamic>> get _songsCollection {
     return _sharedSetlistDoc.collection('songs');
+  }
+
+  CollectionReference<Map<String, dynamic>>? get _legacyUserSongsCollection {
+    return _legacyUserSetlistDoc?.collection('songs');
   }
 
   String? get _resolvedCurrentSongId {
@@ -1091,6 +1107,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       _firebaseUserId = user.uid;
       await _syncSpotifyConnectionStatus();
       await _ensureSharedSetlistExists();
+      await _migrateLegacyUserSetlistIfNeeded();
       await _sharedSetlistSubscription?.cancel();
       await _songsSubscription?.cancel();
 
@@ -1708,6 +1725,36 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       'currentSongArtist': null,
       'updatedAt': FieldValue.serverTimestamp(),
     });
+  }
+
+  Future<void> _migrateLegacyUserSetlistIfNeeded() async {
+    final CollectionReference<Map<String, dynamic>>? legacySongsCollection =
+        _legacyUserSongsCollection;
+    if (legacySongsCollection == null) {
+      return;
+    }
+
+    final QuerySnapshot<Map<String, dynamic>> sharedSongsSnapshot =
+        await _songsCollection.limit(1).get();
+    if (sharedSongsSnapshot.docs.isNotEmpty) {
+      return;
+    }
+
+    final QuerySnapshot<Map<String, dynamic>> legacySongsSnapshot =
+        await legacySongsCollection.orderBy('position').get();
+    if (legacySongsSnapshot.docs.isEmpty) {
+      return;
+    }
+
+    final WriteBatch batch = _firestore.batch();
+    for (final QueryDocumentSnapshot<Map<String, dynamic>> legacySong
+        in legacySongsSnapshot.docs) {
+      batch.set(_songsCollection.doc(legacySong.id), legacySong.data());
+    }
+    batch.set(_sharedSetlistDoc, <String, dynamic>{
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+    await batch.commit();
   }
 
   Future<void> _updateSharedCurrentSong(Song? song) async {
