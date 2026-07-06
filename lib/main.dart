@@ -10,7 +10,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:spotify_sdk/models/player_state.dart';
-import 'package:spotify_sdk/models/track.dart';
 import 'package:spotify_sdk/spotify_sdk.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
@@ -446,10 +445,7 @@ class _SpotifyImportTrack {
 }
 
 class _ImportArtworkThumbnail extends StatelessWidget {
-  const _ImportArtworkThumbnail({
-    required this.artworkUrl,
-    this.size = 48,
-  });
+  const _ImportArtworkThumbnail({required this.artworkUrl, this.size = 48});
 
   final String? artworkUrl;
   final double size;
@@ -590,9 +586,18 @@ class _SetlistActionBarButton extends StatelessWidget {
           children: <Widget>[
             Icon(icon, size: 19),
             const SizedBox(height: 2),
-            Text(
-              label,
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                maxLines: 1,
+                softWrap: false,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
             ),
           ],
         ),
@@ -714,25 +719,6 @@ String _formatRuntime(int seconds) {
   final int minutes = seconds ~/ 60;
   final int remainingSeconds = seconds % 60;
   return '${minutes}m ${remainingSeconds.toString().padLeft(2, '0')}s';
-}
-
-String? _spotifyImageUriToUrl(String? imageUriRaw) {
-  final String raw = (imageUriRaw ?? '').trim();
-  if (raw.isEmpty) {
-    return null;
-  }
-  if (raw.startsWith('http://') || raw.startsWith('https://')) {
-    return raw;
-  }
-  const String prefix = 'spotify:image:';
-  if (!raw.startsWith(prefix)) {
-    return null;
-  }
-  final String imageId = raw.substring(prefix.length).trim();
-  if (imageId.isEmpty) {
-    return null;
-  }
-  return 'https://i.scdn.co/image/$imageId';
 }
 
 Future<void> main() async {
@@ -948,6 +934,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   bool _isPlayerConnecting = false;
   PlayerState? _spotifyPlayerState;
   String? _spotifyPlayerErrorMessage;
+  String? _cloudStateErrorMessage;
   StreamSubscription<PlayerState>? _spotifyPlayerStateSubscription;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
   _sharedSetlistSubscription;
@@ -1023,7 +1010,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
   }
 
   String? _resolveCurrentSongIdFromSharedRef() {
-    final String sharedTrackId = (_sharedCurrentSongSpotifyTrackId ?? '').trim();
+    final String sharedTrackId = (_sharedCurrentSongSpotifyTrackId ?? '')
+        .trim();
     if (sharedTrackId.isNotEmpty) {
       for (final Song song in _songs) {
         if ((song.spotifyTrackId ?? '').trim() == sharedTrackId) {
@@ -1151,15 +1139,17 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
                 return;
               }
               setState(() {
+                _cloudStateErrorMessage = 'Could not load shared setlist.';
                 _isLoading = false;
               });
             },
           );
-    } catch (_) {
+    } catch (error) {
       if (!mounted) {
         return;
       }
       setState(() {
+        _cloudStateErrorMessage = 'Could not connect to shared setlist: $error';
         _isLoading = false;
       });
     }
@@ -1813,7 +1803,8 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       return;
     }
     setState(() {
-      _sharedCurrentSongSpotifyTrackId = (song.spotifyTrackId ?? '').trim().isEmpty
+      _sharedCurrentSongSpotifyTrackId =
+          (song.spotifyTrackId ?? '').trim().isEmpty
           ? null
           : song.spotifyTrackId?.trim();
       _sharedCurrentSongTitle = song.title.trim();
@@ -1821,6 +1812,10 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
       _currentSongId = song.id;
     });
     unawaited(_updateSharedCurrentSong(song));
+  }
+
+  Future<void> _setCurrentSongFromSetlist(String songId) async {
+    _setCurrentSong(songId);
   }
 
   Future<void> _confirmSetCurrentSong(String songId) async {
@@ -1838,9 +1833,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
           builder: (BuildContext context) {
             return AlertDialog(
               backgroundColor: _appSurfaceStrong,
-              title: const Center(
-                child: Text('Set current song?'),
-              ),
+              title: const Center(child: Text('Set current song?')),
               actionsAlignment: MainAxisAlignment.center,
               actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               actions: <Widget>[
@@ -2198,7 +2191,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
         totalRuntime: _formatRuntime(_totalRuntimeSeconds),
         spotifyAccountConnected: _spotifyAccountConnected,
         supportsSpotifyRemotePlayback: _supportsSpotifyRemotePlayback,
-        onSelectSong: _confirmSetCurrentSong,
+        onSelectSong: _setCurrentSongFromSetlist,
         onRemoveSong: _removeSong,
         onEditSong: _editSong,
         onPlaySpotify: _playSongInMiniPlayer,
@@ -2242,7 +2235,7 @@ class _SetlistHomePageState extends State<SetlistHomePage> {
                       _spotifyAccountConnected &&
                           (_spotifyProfileName ?? '').trim().isNotEmpty
                       ? _spotifyProfileName!.trim()
-                      : 'Band setlist companion',
+                      : '',
                   imageUrl: _spotifyAccountConnected
                       ? _spotifyProfileImageUrl
                       : null,
@@ -2371,6 +2364,46 @@ class _SetlistPageState extends State<SetlistPage> {
     unawaited(widget.onPlaySpotify(song));
   }
 
+  Future<void> _confirmSetCurrentSongFromSetlist(Song song) async {
+    if (song.id == widget.currentSong?.id) {
+      return;
+    }
+    final bool confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (BuildContext context) {
+            return AlertDialog(
+              backgroundColor: _appSurfaceStrong,
+              title: const Center(child: Text('Set current song?')),
+              content: Text(
+                'Set "${song.title.trim().isEmpty ? 'Untitled song' : song.title.trim()}" as the current song?',
+              ),
+              actionsAlignment: MainAxisAlignment.center,
+              actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('No'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop(true),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _appPrimary,
+                    foregroundColor: const Color(0xFF171717),
+                  ),
+                  child: const Text('Yes'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+    if (!confirmed || !mounted) {
+      return;
+    }
+    await widget.onSelectSong(song.id);
+  }
+
   void _handleReorderItem(int oldIndex, int newIndex) {
     if (oldIndex == newIndex) {
       return;
@@ -2430,7 +2463,8 @@ class _SetlistPageState extends State<SetlistPage> {
                       : Icons.radio_button_unchecked_rounded,
                   label: isCurrent ? 'Current' : 'Set current',
                   highlighted: isCurrent,
-                  onPressed: () => unawaited(widget.onSelectSong(song.id)),
+                  onPressed: () =>
+                      unawaited(_confirmSetCurrentSongFromSetlist(song)),
                 ),
                 _SetlistActionBarButton(
                   icon: playIcon,
@@ -2642,7 +2676,8 @@ class _SetlistPageState extends State<SetlistPage> {
                     color: Colors.transparent,
                     child: InkWell(
                       borderRadius: BorderRadius.circular(12),
-                      onTap: () => _playSongFromCard(song),
+                      onTap: () =>
+                          unawaited(_confirmSetCurrentSongFromSetlist(song)),
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(0, 10, 0, 10),
                         child: Row(
@@ -2767,7 +2802,11 @@ class _SetlistPageState extends State<SetlistPage> {
                       itemCount: widget.songs.length,
                       onReorderItem: _handleReorderItem,
                       proxyDecorator:
-                          (Widget child, int index, Animation<double> animation) {
+                          (
+                            Widget child,
+                            int index,
+                            Animation<double> animation,
+                          ) {
                             return Material(
                               color: Colors.transparent,
                               elevation: 6,
@@ -2847,10 +2886,7 @@ class _AdjacentSongButton extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w800,
-              ),
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
             ),
           ],
         ],
@@ -3151,8 +3187,11 @@ enum _ImportState { idle, loading, success, error }
 
 enum _ImporterStep { choose, link, account, details }
 
-List<_RoleDraft> _buildPresetEditSongRoleDrafts(List<RoleAssignment> existingRoles) {
-  final Map<String, RoleAssignment> rolesByInstrument = <String, RoleAssignment>{};
+List<_RoleDraft> _buildPresetEditSongRoleDrafts(
+  List<RoleAssignment> existingRoles,
+) {
+  final Map<String, RoleAssignment> rolesByInstrument =
+      <String, RoleAssignment>{};
   final List<RoleAssignment> customRoles = <RoleAssignment>[];
 
   for (final RoleAssignment role in existingRoles) {
@@ -3453,22 +3492,53 @@ class _EditSongPageState extends State<_EditSongPage> {
                                 Row(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: <Widget>[
-                                  if (roleDraft.isPreset)
-                                    SizedBox(
-                                      width: 96,
-                                      child: _RoleInstrumentLabel(
-                                        instrument: instrumentValue,
+                                    if (roleDraft.isPreset)
+                                      SizedBox(
+                                        width: 96,
+                                        child: _RoleInstrumentLabel(
+                                          instrument: instrumentValue,
+                                        ),
+                                      )
+                                    else
+                                      Expanded(
+                                        flex: 2,
+                                        child: DropdownButtonFormField<String>(
+                                          isExpanded: true,
+                                          initialValue: selectedInstrument,
+                                          hint: const Text('Instrument'),
+                                          decoration:
+                                              _rolePillInputDecoration(),
+                                          items: _editableInstrumentOptions
+                                              .map((String option) {
+                                                return DropdownMenuItem<String>(
+                                                  value: option,
+                                                  child: Text(
+                                                    option,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                  ),
+                                                );
+                                              })
+                                              .toList(growable: false),
+                                          onChanged: (String? value) {
+                                            setState(() {
+                                              roleDraft
+                                                      .instrumentController
+                                                      .text =
+                                                  value ?? '';
+                                            });
+                                          },
+                                        ),
                                       ),
-                                    )
-                                  else
+                                    const SizedBox(width: 8),
                                     Expanded(
-                                      flex: 2,
+                                      flex: 3,
                                       child: DropdownButtonFormField<String>(
                                         isExpanded: true,
-                                        initialValue: selectedInstrument,
-                                        hint: const Text('Instrument'),
+                                        initialValue: selectedPlayer,
+                                        hint: const Text('Select player'),
                                         decoration: _rolePillInputDecoration(),
-                                        items: _editableInstrumentOptions
+                                        items: _editablePlayerOptions
                                             .map((String option) {
                                               return DropdownMenuItem<String>(
                                                 value: option,
@@ -3482,62 +3552,32 @@ class _EditSongPageState extends State<_EditSongPage> {
                                             .toList(growable: false),
                                         onChanged: (String? value) {
                                           setState(() {
-                                            roleDraft
-                                                    .instrumentController
-                                                    .text =
+                                            roleDraft.playerController.text =
                                                 value ?? '';
                                           });
                                         },
                                       ),
                                     ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    flex: 3,
-                                    child: DropdownButtonFormField<String>(
-                                      isExpanded: true,
-                                      initialValue: selectedPlayer,
-                                      hint: const Text('Select player'),
-                                      decoration: _rolePillInputDecoration(),
-                                      items: _editablePlayerOptions
-                                          .map((String option) {
-                                            return DropdownMenuItem<String>(
-                                              value: option,
-                                              child: Text(
-                                                option,
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            );
-                                          })
-                                          .toList(growable: false),
-                                      onChanged: (String? value) {
-                                        setState(() {
-                                          roleDraft.playerController.text =
-                                              value ?? '';
-                                        });
-                                      },
-                                    ),
-                                  ),
-                                  if (!roleDraft.isPreset)
-                                    IconButton(
-                                      onPressed: () =>
-                                          _removeRoleDraft(roleDraft),
-                                      icon: const Icon(
-                                        Icons.delete_outline_rounded,
+                                    if (!roleDraft.isPreset)
+                                      IconButton(
+                                        onPressed: () =>
+                                            _removeRoleDraft(roleDraft),
+                                        icon: const Icon(
+                                          Icons.delete_outline_rounded,
+                                        ),
+                                        tooltip: 'Remove role',
                                       ),
-                                      tooltip: 'Remove role',
-                                    ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              TextField(
-                                controller: roleDraft.chartUrlController,
-                                decoration: _rolePillInputDecoration(
-                                  hintText:
-                                      'Chords/Tab link (optional)',
+                                  ],
                                 ),
-                              ),
-                            ],
-                          ),
+                                const SizedBox(height: 12),
+                                TextField(
+                                  controller: roleDraft.chartUrlController,
+                                  decoration: _rolePillInputDecoration(
+                                    hintText: 'Chords/Tab link (optional)',
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         );
                       }),
@@ -4282,7 +4322,9 @@ class _SongImporterPageState extends State<_SongImporterPage> {
     if (tracks.isEmpty) {
       throw const FormatException('No tracks found');
     }
-    final Map<String, dynamic>? playlistMap = _asStringKeyedMap(payload['playlist']);
+    final Map<String, dynamic>? playlistMap = _asStringKeyedMap(
+      payload['playlist'],
+    );
     final String? playlistArtworkUrl = playlistMap == null
         ? null
         : _SpotifyPlaylistSummary.fromJson(playlistMap).artworkUrl;
@@ -4335,10 +4377,8 @@ class _SongImporterPageState extends State<_SongImporterPage> {
         _playlistImportArtworkUrl = null;
       });
       try {
-        final ({
-          List<_SpotifyImportTrack> tracks,
-          String? playlistArtworkUrl,
-        }) importResult = await _importFromBackend(spotifyUri);
+        final ({List<_SpotifyImportTrack> tracks, String? playlistArtworkUrl})
+        importResult = await _importFromBackend(spotifyUri);
         if (!mounted) {
           return;
         }
@@ -5046,6 +5086,7 @@ class _TopStatusBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final String trimmedSubtitle = subtitle.trim();
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: <Widget>[
@@ -5063,11 +5104,13 @@ class _TopStatusBar extends StatelessWidget {
                   fontSize: 14,
                 ),
               ),
-              const SizedBox(height: 2),
-              Text(
-                subtitle,
-                style: const TextStyle(color: _appMutedText, fontSize: 12),
-              ),
+              if (trimmedSubtitle.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 2),
+                Text(
+                  trimmedSubtitle,
+                  style: const TextStyle(color: _appMutedText, fontSize: 12),
+                ),
+              ],
             ],
           ),
         ),
@@ -5223,19 +5266,14 @@ class _CurrentSongBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final Track? track = playerState?.track;
     final String title = song.title.trim().isEmpty
         ? 'Untitled song'
         : song.title.trim();
     final String artistName = song.artist.trim().isEmpty
         ? 'Unknown artist'
         : song.artist.trim();
-    final String? spotifyArtworkUrl = _spotifyImageUriToUrl(
-      track?.imageUri.raw,
-    );
     final String artworkFallback = (song.artworkUrl ?? '').trim();
-    final String? artworkUrl =
-        spotifyArtworkUrl ?? (artworkFallback.isEmpty ? null : artworkFallback);
+    final String? artworkUrl = artworkFallback.isEmpty ? null : artworkFallback;
     final String playbackError = (errorMessage ?? '').trim();
     final bool hasPlaybackError = playbackError.isNotEmpty;
     final bool isPlaying = !(playerState?.isPaused ?? true);
@@ -5575,12 +5613,21 @@ class _BottomActionButton extends StatelessWidget {
               children: <Widget>[
                 Icon(icon, size: 20, color: foregroundColor),
                 const SizedBox(height: 4),
-                Text(
-                  label,
-                  style: TextStyle(
-                    color: foregroundColor,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
+                SizedBox(
+                  width: double.infinity,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      softWrap: false,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: foregroundColor,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ),
                 ),
               ],
@@ -5625,10 +5672,7 @@ class _SectionCard extends StatelessWidget {
 }
 
 class _ReadOnlySongDetailTile extends StatelessWidget {
-  const _ReadOnlySongDetailTile({
-    required this.label,
-    required this.value,
-  });
+  const _ReadOnlySongDetailTile({required this.label, required this.value});
 
   final String label;
   final String value;
